@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "covnorm"
-version = "0.1.0"
+version = "0.1.1"
 description = "Robust conditional normalization of continuous markers using polynomial surface fitting over categorical and continuous covariates"
 readme = "README.md"
 license = { text = "MIT" }
