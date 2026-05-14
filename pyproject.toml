@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Robust conditional normalization of continuous markers using polynomial surface fitting over categorical and continuous covariates"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 keywords = ["normalization", "statistics", "machine-learning", "covariates", "z-score", "scikit-learn"]
 classifiers = [
     "Development Status :: 3 - Alpha",
