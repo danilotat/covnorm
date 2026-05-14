@@ -102,11 +102,16 @@ def test_clone_produces_unfitted_copy(normalizer_full, data):
 
 
 def test_pipeline_compatible(data):
-    pipe = Pipeline([
-        ("norm", RobustConditionalNormalizer(
-            categorical_cols=[0, 1], continuous_cols=[2], target_col=3
-        ))
-    ])
+    pipe = Pipeline(
+        [
+            (
+                "norm",
+                RobustConditionalNormalizer(
+                    categorical_cols=[0, 1], continuous_cols=[2], target_col=3
+                ),
+            )
+        ]
+    )
     X_norm = pipe.fit_transform(data)
     assert X_norm.shape == data.shape
 
@@ -162,9 +167,9 @@ def test_zscore_mean_near_zero_per_group(data):
     for sex_val in [0, 1]:
         mask = data[:, 0] == sex_val
         group_z = X_norm[mask, 3]
-        assert abs(np.mean(group_z)) < 0.3, (
-            f"Mean Z-score for sex={sex_val} is {np.mean(group_z):.3f}, expected near 0"
-        )
+        assert (
+            abs(np.mean(group_z)) < 0.3
+        ), f"Mean Z-score for sex={sex_val} is {np.mean(group_z):.3f}, expected near 0"
 
 
 def test_zscore_std_near_one_per_group(data):
@@ -176,9 +181,9 @@ def test_zscore_std_near_one_per_group(data):
     for sex_val in [0, 1]:
         mask = data[:, 0] == sex_val
         group_z = X_norm[mask, 3]
-        assert 0.7 < np.std(group_z) < 1.3, (
-            f"Std Z-score for sex={sex_val} is {np.std(group_z):.3f}, expected near 1"
-        )
+        assert (
+            0.7 < np.std(group_z) < 1.3
+        ), f"Std Z-score for sex={sex_val} is {np.std(group_z):.3f}, expected near 1"
 
 
 def test_groups_are_normalized_independently(data):
@@ -262,7 +267,7 @@ def test_constant_target_does_not_raise():
     """sigma floor at 1e-6 must prevent division by zero."""
     X = np.zeros((50, 3))
     X[:, 0] = np.arange(50)  # continuous covariate
-    X[:, 1] = 1.0             # constant target
+    X[:, 1] = 1.0  # constant target
     norm = RobustConditionalNormalizer(
         categorical_cols=[], continuous_cols=[0], target_col=1
     )
@@ -275,11 +280,13 @@ def test_constant_target_does_not_raise():
 def test_single_sample_per_group_falls_back(rng=RNG):
     """Groups with fewer than MIN_BIN_SAMPLES should fall back gracefully."""
     n = 5
-    X = np.column_stack([
-        np.zeros(n),                     # categorical col (single group)
-        rng.uniform(0, 1, n),            # continuous col
-        rng.normal(0, 1, n),             # target
-    ])
+    X = np.column_stack(
+        [
+            np.zeros(n),  # categorical col (single group)
+            rng.uniform(0, 1, n),  # continuous col
+            rng.normal(0, 1, n),  # target
+        ]
+    )
     norm = RobustConditionalNormalizer(
         categorical_cols=[0], continuous_cols=[1], target_col=2, n_bins=6
     )
@@ -297,22 +304,30 @@ def test_single_sample_per_group_falls_back(rng=RNG):
 
 def test_too_many_categorical_raises():
     with pytest.raises(ValueError, match="Exceeded max categorical"):
-        RobustConditionalNormalizer(categorical_cols=[0, 1, 2], continuous_cols=[], target_col=3)
+        RobustConditionalNormalizer(
+            categorical_cols=[0, 1, 2], continuous_cols=[], target_col=3
+        )
 
 
 def test_too_many_continuous_raises():
     with pytest.raises(ValueError, match="Exceeded max continuous"):
-        RobustConditionalNormalizer(categorical_cols=[], continuous_cols=[0, 1, 2], target_col=3)
+        RobustConditionalNormalizer(
+            categorical_cols=[], continuous_cols=[0, 1, 2], target_col=3
+        )
 
 
 def test_target_col_in_categorical_raises():
     with pytest.raises(ValueError, match="Target column cannot be included"):
-        RobustConditionalNormalizer(categorical_cols=[0], continuous_cols=[1], target_col=0)
+        RobustConditionalNormalizer(
+            categorical_cols=[0], continuous_cols=[1], target_col=0
+        )
 
 
 def test_target_col_in_continuous_raises():
     with pytest.raises(ValueError, match="Target column cannot be included"):
-        RobustConditionalNormalizer(categorical_cols=[0], continuous_cols=[1], target_col=1)
+        RobustConditionalNormalizer(
+            categorical_cols=[0], continuous_cols=[1], target_col=1
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -81,7 +81,9 @@ class ContinuousSurfaceFitter:
     def __init__(self, n_bins: int, degree: int):
         self.n_bins = n_bins
         self.degree = degree
-        self.poly_transformer = PolynomialFeatures(degree=self.degree, include_bias=True)
+        self.poly_transformer = PolynomialFeatures(
+            degree=self.degree, include_bias=True
+        )
         self.mu_model = LinearRegression(fit_intercept=False)
         self.sigma_model = LinearRegression(fit_intercept=False)
         self._global_mu: float = 0.0
@@ -321,7 +323,9 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         if self.target_col in all_cols:
             raise ValueError("Target column cannot be included in covariates.")
 
-    def fit(self, X: np.ndarray, y: Optional[np.ndarray] = None) -> "RobustConditionalNormalizer":
+    def fit(
+        self, X: np.ndarray, y: Optional[np.ndarray] = None
+    ) -> "RobustConditionalNormalizer":
         """Fit one surface model per categorical subgroup.
 
         Parameters
@@ -343,7 +347,9 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             cat_groups = [(tuple(), np.arange(X.shape[0]))]
         else:
             cat_data = X[:, self.categorical_cols]
-            unique_rows, inverse_indices = np.unique(cat_data, axis=0, return_inverse=True)
+            unique_rows, inverse_indices = np.unique(
+                cat_data, axis=0, return_inverse=True
+            )
             cat_groups = [
                 (tuple(unique_rows[i]), np.where(inverse_indices == i)[0])
                 for i in range(len(unique_rows))
@@ -384,7 +390,9 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             cat_groups = [(tuple(), np.arange(X_out.shape[0]))]
         else:
             cat_data = X_out[:, self.categorical_cols]
-            unique_rows, inverse_indices = np.unique(cat_data, axis=0, return_inverse=True)
+            unique_rows, inverse_indices = np.unique(
+                cat_data, axis=0, return_inverse=True
+            )
             cat_groups = [
                 (tuple(unique_rows[i]), np.where(inverse_indices == i)[0])
                 for i in range(len(unique_rows))
@@ -392,7 +400,9 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
 
         for cat_tuple, row_indices in cat_groups:
             if cat_tuple not in self._models:
-                warnings.warn(f"Unseen categorical combination {cat_tuple}. Setting Z-scores to 0.")
+                warnings.warn(
+                    f"Unseen categorical combination {cat_tuple}. Setting Z-scores to 0."
+                )
                 X_out[row_indices, self.target_col] = 0.0
                 continue
 
