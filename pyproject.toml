@@ -27,8 +27,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/dtatoni/covnorm"
-Issues = "https://github.com/dtatoni/covnorm/issues"
+Homepage = "https://github.com/danilotat/covnorm"
+Issues = "https://github.com/danilotat/covnorm/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/covnorm"]
