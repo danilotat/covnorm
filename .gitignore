@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# uv / pyenv local config (not committed for libraries)
+uv.lock
+.python-version
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
