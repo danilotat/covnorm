@@ -269,7 +269,7 @@ def test_constant_target_does_not_raise():
     """sigma floor at 1e-6 must prevent division by zero for near-constant data."""
     rng = np.random.default_rng(0)
     X = np.zeros((50, 3))
-    X[:, 0] = np.arange(50)         # continuous covariate
+    X[:, 0] = np.arange(50)  # continuous covariate
     X[:, 1] = 1.0 + rng.gamma(0.001, 0.001, 50)  # near-constant positive target
     norm = RobustConditionalNormalizer(
         categorical_cols=[], continuous_cols=[0], target_col=1
@@ -285,9 +285,9 @@ def test_single_sample_per_group_falls_back(rng=RNG):
     n = 5
     X = np.column_stack(
         [
-            np.zeros(n),          # categorical col (single group)
-            rng.uniform(0, 1, n), # continuous col
-            rng.gamma(2, 1, n),   # target: strictly positive for Box-Cox
+            np.zeros(n),  # categorical col (single group)
+            rng.uniform(0, 1, n),  # continuous col
+            rng.gamma(2, 1, n),  # target: strictly positive for Box-Cox
         ]
     )
     norm = RobustConditionalNormalizer(

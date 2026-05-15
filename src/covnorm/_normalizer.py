@@ -205,7 +205,9 @@ class ContinuousSurfaceFitter:
             for c, b_idx in enumerate(bin_indices):
                 lower, upper = bin_edges[c][b_idx], bin_edges[c][b_idx + 1]
                 if b_idx == self.n_bins - 1:
-                    mask &= (X_cont_clean[:, c] >= lower) & (X_cont_clean[:, c] <= upper)
+                    mask &= (X_cont_clean[:, c] >= lower) & (
+                        X_cont_clean[:, c] <= upper
+                    )
                 else:
                     mask &= (X_cont_clean[:, c] >= lower) & (X_cont_clean[:, c] < upper)
                 centers.append((lower + upper) / 2.0)
@@ -311,9 +313,7 @@ class ContinuousSurfaceFitter:
         sigma, mu = np.polyfit(z_theoretical, bin_data_bc, deg=1)
         return mu, max(sigma, 1e-6)
 
-    def _tukey_z_filter(
-        self, y: np.ndarray, z_threshold: float = 3.372
-    ) -> np.ndarray:
+    def _tukey_z_filter(self, y: np.ndarray, z_threshold: float = 3.372) -> np.ndarray:
         """Identify inliers using a z-score threshold in Box-Cox transformed space.
 
         Applies Tukey's fence with factor 2 in z-score space, equivalent to
@@ -589,7 +589,11 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         return X_out
 
 
-__all__ = ["RobustNormalizerConfig", "ContinuousSurfaceFitter", "RobustConditionalNormalizer"]
+__all__ = [
+    "RobustNormalizerConfig",
+    "ContinuousSurfaceFitter",
+    "RobustConditionalNormalizer",
+]
 
 
 if __name__ == "__main__":
@@ -599,7 +603,9 @@ if __name__ == "__main__":
     groups = []
     for group_id in (0, 1):
         age = rng.uniform(0.01, 100, n_per_group)
-        marker = rng.gamma(shape=2, scale=10, size=n_per_group)  # right-skewed, positive
+        marker = rng.gamma(
+            shape=2, scale=10, size=n_per_group
+        )  # right-skewed, positive
         cat = np.full(n_per_group, float(group_id))
         groups.append(np.column_stack([cat, age, marker]))
     X = np.vstack(groups)
@@ -621,11 +627,11 @@ if __name__ == "__main__":
         mean_z = float(np.mean(z))
         std_z = float(np.std(z))
         # 3. mean within 0.1 of 0 and std within 0.2 of 1
-        assert abs(mean_z) < 0.1, (
-            f"Group {group_id}: mean z = {mean_z:.4f}, expected |mean| < 0.1"
-        )
-        assert abs(std_z - 1.0) < 0.2, (
-            f"Group {group_id}: std z = {std_z:.4f}, expected |std - 1| < 0.2"
-        )
+        assert (
+            abs(mean_z) < 0.1
+        ), f"Group {group_id}: mean z = {mean_z:.4f}, expected |mean| < 0.1"
+        assert (
+            abs(std_z - 1.0) < 0.2
+        ), f"Group {group_id}: std z = {std_z:.4f}, expected |std - 1| < 0.2"
 
     print("PASS")
