@@ -97,7 +97,7 @@ def test_set_params():
 
 def test_clone_produces_unfitted_copy(normalizer_full, data):
     cloned = clone(normalizer_full)
-    assert cloned._models == {}
+    assert cloned._cat_corrections == {}
     # cloned estimator must be independently fittable
     X_norm = cloned.fit_transform(data)
     assert X_norm.shape == data.shape
@@ -215,7 +215,7 @@ def test_no_categorical_covariates(data):
     )
     X_norm = norm.fit_transform(data)
     assert X_norm.shape == data.shape
-    assert len(norm._models) == 1  # single global group
+    assert len(norm._cat_corrections) == 1  # single global group
 
 
 def test_no_continuous_covariates(data):
@@ -232,7 +232,7 @@ def test_no_covariates_global_normalization(data):
     )
     X_norm = norm.fit_transform(data)
     assert X_norm.shape == data.shape
-    assert len(norm._models) == 1
+    assert len(norm._cat_corrections) == 1
 
 
 def test_two_categorical_covariates(data):
@@ -241,7 +241,7 @@ def test_two_categorical_covariates(data):
     )
     X_norm = norm.fit_transform(data)
     assert X_norm.shape == data.shape
-    assert len(norm._models) == 2  # (sex=0,batch=0) and (sex=1,batch=1)
+    assert len(norm._cat_corrections) == 2  # (sex=0,batch=0) and (sex=1,batch=1)
 
 
 # ---------------------------------------------------------------------------

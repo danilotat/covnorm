@@ -1,11 +1,10 @@
 import warnings
 from dataclasses import dataclass
-from itertools import product
-from typing import Optional, Sequence, Tuple, Dict
+from typing import Optional, Sequence, Tuple, Dict, List
 
 import numpy as np
 import scipy.stats as stats
-from scipy.stats import boxcox, boxcox_normmax
+from scipy.stats import boxcox
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import PolynomialFeatures
@@ -22,7 +21,9 @@ class RobustNormalizerConfig:
         :class:`RobustConditionalNormalizer`.
     MAX_CONTINUOUS : int
         Maximum number of continuous covariates accepted by
-        :class:`RobustConditionalNormalizer`.
+        :class:`RobustConditionalNormalizer`. Restricted to 1 to avoid
+        the curse of dimensionality inherent in multi-dimensional grid binning
+        (ADHERENCE Fix 4).
     MIN_BIN_SAMPLES : int
         Minimum number of samples required in a bin to attempt
         Q-Q regression. Bins below this threshold are skipped.
@@ -31,44 +32,52 @@ class RobustNormalizerConfig:
     """
 
     MAX_CATEGORICAL: int = 2
-    MAX_CONTINUOUS: int = 2
+    MAX_CONTINUOUS: int = 1
     MIN_BIN_SAMPLES: int = 30
 
 
 class ContinuousSurfaceFitter:
-    """Polynomial surface model for mu and sigma over continuous covariates.
+    """Polynomial surface model for mu and sigma over a single continuous covariate.
 
-    For each categorical subgroup, this class partitions the continuous
-    covariate space into a quantile-based grid of equal-size bins, estimates
-    mu and sigma per bin via Q-Q regression on Box-Cox transformed data with
-    iterative Tukey z-score outlier rejection, then fits a polynomial surface
-    through the valid bin estimates. At prediction time the surface is
-    evaluated at the exact covariate values of each sample.
+    Sorts the data by the continuous covariate, creates rolling overlapping
+    windows of a fixed number of samples (``bin_size``), estimates mu and sigma
+    per window via Q-Q regression on Box-Cox transformed data, then fits a
+    polynomial curve through the valid window estimates. At prediction time the
+    curve is evaluated at the exact covariate values of each sample.
+
+    Outlier removal is iterative and conditional: after each polynomial fit the
+    per-sample conditional Z-scores ``(BoxCox(y) - mu(x)) / sigma(x)`` are
+    computed and samples with ``|Z| > 3.372`` are dropped before the next fit.
 
     When no continuous covariates are present, or when the number of valid
-    bins is insufficient for stable polynomial fitting, the estimator falls
+    windows is insufficient for stable polynomial fitting, the estimator falls
     back to a single global (mu, sigma) pair derived from the full group.
     All mu and sigma values live in Box-Cox transformed space.
 
     Parameters
     ----------
     n_bins : int
-        Number of equal-size bins per continuous covariate axis.
+        Target number of rolling windows. Controls the stride as
+        ``stride = (n - bin_size) // (n_bins - 1)``.
     degree : int, default=3
-        Degree of the polynomial surface fitted to the bin estimates.
+        Degree of the polynomial curve fitted to the window estimates.
         Mørkved et al. (2015) use cubic polynomials.
     lambda_ : float or None, default=None
         Box-Cox transformation parameter. When ``None`` the optimal value
-        is found automatically via ``scipy.stats.boxcox_normmax`` during
-        :meth:`fit` and stored as ``self.lambda_``. When provided, that
-        value is used directly and stored unchanged.
+        is found via a grid search over [-2, 2] that maximises the Pearson
+        correlation between sorted BoxCox(y) values and their theoretical
+        normal quantiles (Q-Q linearity). When provided, that value is used
+        directly and stored unchanged.
     n_iterations : int, default=3
-        Number of iterative Tukey z-score outlier-removal passes applied
-        to the full group data before binning.
+        Maximum number of iterative conditional outlier-removal passes.
+        Each pass refits the polynomial surface and removes samples whose
+        conditional Z-score exceeds 3.372 in absolute value.
     log_transform_continuous : bool, default=False
         When ``True``, ``log10`` is applied to all continuous covariate
         columns at the start of :meth:`fit` and :meth:`predict_mu_sigma`.
         Requires all covariate values to be strictly positive.
+    bin_size : int, default=120
+        Number of samples per rolling window. Mørkved et al. (2015) use 120.
 
     Attributes
     ----------
@@ -93,7 +102,7 @@ class ContinuousSurfaceFitter:
     Notes
     -----
     Q-Q regression estimates mu and sigma by fitting a line through the
-    empirical quantiles of Box-Cox transformed bin data against the
+    empirical quantiles of Box-Cox transformed window data against the
     corresponding theoretical normal quantiles using the Blom plotting
     position formula ``(i - 3/8) / (n + 1/4)``. The slope gives sigma
     and the intercept gives mu, both in Box-Cox space. Sigma is floored
@@ -107,12 +116,14 @@ class ContinuousSurfaceFitter:
         lambda_: Optional[float] = None,
         n_iterations: int = 3,
         log_transform_continuous: bool = False,
+        bin_size: int = 120,
     ):
         self.n_bins = n_bins
         self.degree = degree
         self.lambda_ = lambda_
         self.n_iterations = n_iterations
         self.log_transform_continuous = log_transform_continuous
+        self.bin_size = bin_size
         self.poly_transformer = PolynomialFeatures(
             degree=self.degree, include_bias=True
         )
@@ -123,18 +134,18 @@ class ContinuousSurfaceFitter:
         self._is_fitted: bool = False
 
     def fit(self, X_cont: np.ndarray, y: np.ndarray) -> "ContinuousSurfaceFitter":
-        """Fit the polynomial mu/sigma surface to binned estimates.
+        """Fit the polynomial mu/sigma curve to rolling window estimates.
 
         Parameters
         ----------
         X_cont : ndarray of shape (n_samples, n_features)
             Continuous covariate matrix. Pass an array with zero columns
             (``n_features == 0``) to trigger the global fallback.
+            Must have at most one column (``n_features <= 1``).
             All values must be strictly positive when
             ``log_transform_continuous=True``.
         y : ndarray of shape (n_samples,)
-            Target values for the current categorical subgroup. Must be
-            strictly positive (required by the Box-Cox transform).
+            Target values. Must be strictly positive (required by Box-Cox).
 
         Returns
         -------
@@ -164,62 +175,47 @@ class ContinuousSurfaceFitter:
             )
 
         if self.lambda_ is None:
-            self.lambda_ = float(boxcox_normmax(y))
-
-        y_clean = y.copy()
-        X_cont_clean = X_cont.copy()
-        for _ in range(self.n_iterations):
-            mask = self._tukey_z_filter(y_clean)
-            if mask.all():
-                break
-            y_clean = y_clean[mask]
-            if n_features > 0:
-                X_cont_clean = X_cont_clean[mask]
+            self.lambda_ = self._find_lambda_grid_search(y)
 
         if n_features == 0:
-            self._fit_fallback(y_clean)
+            self._fit_fallback(y)
             return self
 
-        n_clean = len(y_clean)
-        # equal size bins. Note that this diverges from the previous implementation where bins where computed using np.linspace, thus not quantiles.
-        bin_edges = [
-            np.quantile(X_cont_clean[:, c], np.linspace(0, 1, self.n_bins + 1))
-            for c in range(n_features)
-        ]
-        valid_centers, mu_estimates, sigma_estimates = [], [], []
-        # that's the core of covnorm. Here we're doing iteratively the computation for each bins in each feature.
-        for bin_indices in product(*(range(self.n_bins) for _ in range(n_features))):
-            mask = np.ones(n_clean, dtype=bool)
-            centers = []
-            for c, b_idx in enumerate(bin_indices):
-                lower, upper = bin_edges[c][b_idx], bin_edges[c][b_idx + 1]
-                if b_idx == self.n_bins - 1:
-                    mask &= (X_cont_clean[:, c] >= lower) & (
-                        X_cont_clean[:, c] <= upper
-                    )
-                else:
-                    mask &= (X_cont_clean[:, c] >= lower) & (X_cont_clean[:, c] < upper)
-                centers.append((lower + upper) / 2.0)
+        # Iterative conditional outlier removal: fit surface, compute
+        # conditional Z-scores, drop |Z| > 3.372, repeat.
+        y_work = y.copy()
+        X_work = X_cont.copy()
 
-            bin_y = y_clean[mask]
-            if len(bin_y) >= RobustNormalizerConfig.MIN_BIN_SAMPLES:
-                mu, sigma = self._robust_qq_estimation(bin_y, self.lambda_)
-                if mu is not None and sigma is not None:
-                    valid_centers.append(centers)
-                    mu_estimates.append(mu)
-                    sigma_estimates.append(sigma)
-
-        if len(valid_centers) < (self.degree + 1) ** n_features:
-            warnings.warn(
-                "Too few valid bins for stable polynomial fitting. Falling back to global estimates."
+        for _ in range(self.n_iterations):
+            valid_centers, mu_estimates, sigma_estimates = self._create_rolling_bins(
+                X_work[:, 0], y_work
             )
-            self._fit_fallback(y_clean)
-            return self
 
-        X_poly = self.poly_transformer.fit_transform(np.array(valid_centers))
-        self.mu_model.fit(X_poly, mu_estimates)
-        self.sigma_model.fit(X_poly, sigma_estimates)
-        self._is_fitted = True
+            if len(valid_centers) < (self.degree + 1):
+                warnings.warn(
+                    "Too few valid bins for stable polynomial fitting. "
+                    "Falling back to global estimates."
+                )
+                self._fit_fallback(y_work)
+                return self
+
+            X_poly = self.poly_transformer.fit_transform(np.array(valid_centers))
+            self.mu_model.fit(X_poly, mu_estimates)
+            self.sigma_model.fit(X_poly, sigma_estimates)
+            self._is_fitted = True
+
+            X_poly_work = self.poly_transformer.transform(X_work)
+            mu_pred = self.mu_model.predict(X_poly_work)
+            sigma_pred = np.maximum(self.sigma_model.predict(X_poly_work), 1e-6)
+            y_bc = boxcox(y_work, lmbda=self.lambda_)
+            z = (y_bc - mu_pred) / sigma_pred
+            mask = np.abs(z) <= 3.372
+
+            if mask.all():
+                break
+            y_work = y_work[mask]
+            X_work = X_work[mask]
+
         return self
 
     def predict_mu_sigma(self, X_cont: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -244,11 +240,99 @@ class ContinuousSurfaceFitter:
                 np.full(X_cont.shape[0], self._global_mu),
                 np.full(X_cont.shape[0], self._global_sigma),
             )
-        # NOTE: this log10 transform is used to match the original paper implementation. Here, to ensure flexibility is leaved as an argument, but in most of the cases it should not be required
         if self.log_transform_continuous:
             X_cont = np.log10(X_cont)
         X_poly = self.poly_transformer.transform(X_cont)
         return self.mu_model.predict(X_poly), self.sigma_model.predict(X_poly)
+
+    def _find_lambda_grid_search(self, y: np.ndarray, n_points: int = 41) -> float:
+        """Find Box-Cox lambda that maximises Q-Q linearity (Pearson R).
+
+        Evaluates the Pearson correlation between sorted ``BoxCox(y, lam)``
+        values and their Blom theoretical normal quantiles across a uniform
+        grid of ``n_points`` lambda values in [-2, 2]. The lambda yielding
+        the highest correlation is returned.
+
+        Parameters
+        ----------
+        y : ndarray of shape (n_samples,)
+            Strictly positive target values.
+        n_points : int, default=41
+            Number of lambda candidates to evaluate.
+
+        Returns
+        -------
+        best_lambda : float
+        """
+        lambdas = np.linspace(-2.0, 2.0, n_points)
+        n = len(y)
+        probs = (np.arange(1, n + 1) - 3 / 8) / (n + 1 / 4)
+        z_theoretical = stats.norm.ppf(probs)
+        best_lambda = 0.0
+        best_r = -np.inf
+        for lam in lambdas:
+            try:
+                y_bc = np.sort(boxcox(y, lmbda=lam))
+            except Exception:
+                continue
+            r = float(np.corrcoef(z_theoretical, y_bc)[0, 1])
+            if r > best_r:
+                best_r = r
+                best_lambda = float(lam)
+        return best_lambda
+
+    def _create_rolling_bins(
+        self, x: np.ndarray, y: np.ndarray
+    ) -> Tuple[List, List, List]:
+        """Build rolling overlapping windows sorted by the continuous covariate.
+
+        The stride between consecutive windows is
+        ``max(1, (n - bin_size) // (n_bins - 1))``, which targets
+        approximately ``n_bins`` windows. Each window's x-coordinate for the
+        polynomial fit is the median of the covariate values inside it.
+
+        Parameters
+        ----------
+        x : ndarray of shape (n_samples,)
+            Continuous covariate values (already log-transformed if applicable).
+        y : ndarray of shape (n_samples,)
+            Target values, strictly positive.
+
+        Returns
+        -------
+        valid_centers : list of list[float]
+            Median covariate value for each valid window, shape (n_valid, 1).
+        mu_estimates : list of float
+        sigma_estimates : list of float
+        """
+        n = len(y)
+        sort_idx = np.argsort(x)
+        x_sorted = x[sort_idx]
+        y_sorted = y[sort_idx]
+
+        if n <= self.bin_size:
+            mu, sigma = self._robust_qq_estimation(y_sorted, self.lambda_)
+            if mu is None:
+                return [], [], []
+            return [[float(np.median(x_sorted))]], [mu], [sigma]
+
+        stride = max(1, (n - self.bin_size) // max(self.n_bins - 1, 1))
+        valid_centers: List = []
+        mu_estimates: List = []
+        sigma_estimates: List = []
+
+        for start in range(0, n - self.bin_size + 1, stride):
+            bin_y = y_sorted[start : start + self.bin_size]
+            bin_x = x_sorted[start : start + self.bin_size]
+            if len(bin_y) < RobustNormalizerConfig.MIN_BIN_SAMPLES:
+                continue
+            mu, sigma = self._robust_qq_estimation(bin_y, self.lambda_)
+            if mu is not None and sigma is not None:
+                valid_centers.append([float(np.median(bin_x))])
+                mu_estimates.append(mu)
+                sigma_estimates.append(sigma)
+
+        return valid_centers, mu_estimates, sigma_estimates
 
     def _robust_qq_estimation(
         self, bin_data: np.ndarray, lambda_: float
@@ -286,13 +370,11 @@ class ContinuousSurfaceFitter:
                 "bin_data contains values <= 0; shift the data before "
                 "applying Box-Cox."
             )
-        # this apply box-cox transforming before doing sort-regression
         bin_data_bc = np.sort(boxcox(bin_data, lmbda=lambda_))
         n = len(bin_data_bc)
         if n < 2:
             return None, None
 
-        # NOTE: blom formula for computing theoretically probs, based on the gaussian assumption. While this is for keeping concordance with the original publication, would be great to eval its power and consider deviations to this, maybe with other background distributions.
         probs = (np.arange(1, n + 1) - 3 / 8) / (n + 1 / 4)
         z_theoretical = stats.norm.ppf(probs)
 
@@ -302,43 +384,13 @@ class ContinuousSurfaceFitter:
         sigma, mu = np.polyfit(z_theoretical, bin_data_bc, deg=1)
         return mu, max(sigma, 1e-6)
 
-    def _tukey_z_filter(self, y: np.ndarray, z_threshold: float = 3.372) -> np.ndarray:
-        """Identify inliers using a z-score threshold in Box-Cox transformed space.
-
-        Applies Tukey's fence with factor 2 in z-score space, equivalent to
-        |z| > 3.372 for a standard normal distribution (Mørkved et al. 2015,
-        § Methods). A preliminary mu and sigma are obtained from
-        :meth:`_robust_qq_estimation` and used to compute per-sample z-scores.
-
-        Parameters
-        ----------
-        y : ndarray of shape (n_samples,)
-            Raw target values. Must be strictly positive.
-        z_threshold : float, default=3.372
-            Samples with ``|z| > z_threshold`` in Box-Cox space are flagged
-            as outliers. The default corresponds to Tukey's factor 2 in
-            z-score space.
-
-        Returns
-        -------
-        mask : ndarray of bool, shape (n_samples,)
-            ``True`` for inlier samples.
-        """
-        mu, sigma = self._robust_qq_estimation(y, self.lambda_)
-        if mu is None:
-            return np.ones(len(y), dtype=bool)
-        y_bc = boxcox(y, lmbda=self.lambda_)
-        z = (y_bc - mu) / sigma
-        return np.abs(z) <= z_threshold
-
     def _fit_fallback(self, y: np.ndarray) -> None:
         """Set global mu/sigma (in Box-Cox space) when binning is not viable.
 
         Parameters
         ----------
         y : ndarray of shape (n_samples,)
-            Target values for the current categorical subgroup. Must be
-            strictly positive.
+            Target values for the current group. Must be strictly positive.
         """
         mu, sigma = self._robust_qq_estimation(y, self.lambda_)
         if mu is None or sigma is None:
@@ -354,50 +406,54 @@ class ContinuousSurfaceFitter:
 class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
     """Robust conditional Z-score normalization over categorical and continuous covariates.
 
-    For each unique combination of categorical covariate values the
-    transformer fits a :class:`ContinuousSurfaceFitter` that models how the
-    location (mu) and scale (sigma) of the target marker vary across the
-    continuous covariate space. At transform time, each sample is
-    standardised as ``z = (BoxCox(y) - mu(x)) / sigma(x)`` where ``x`` is
-    its vector of continuous covariate values and mu/sigma live in Box-Cox
-    transformed space.
+    A single polynomial surface is fitted across the entire dataset (ignoring
+    categorical groups during curve fitting). Base Z-scores are then computed
+    for all samples using this shared surface. A post-hoc correction is applied
+    per categorical group: the mean (``mu_cat``) and standard deviation
+    (``sigma_cat``) of the base Z-scores within each group are subtracted and
+    divided out, yielding ``Z_corrected = (Z_base - mu_cat) / sigma_cat``. This
+    avoids the severe overfitting that arises from fitting independent surfaces
+    per group.
 
-    Outlier-robust estimation (iterative Tukey z-score fence + Q-Q regression
-    on Box-Cox transformed values) is applied within each bin, making the
-    normalizer resistant to heavy-tailed distributions common in flow
-    cytometry and single-cell measurements.
+    Outlier-robust estimation (iterative conditional Z-score fence + Q-Q
+    regression on Box-Cox transformed values) is applied within each rolling
+    window, making the normalizer resistant to heavy-tailed distributions common
+    in flow cytometry and single-cell measurements.
 
     Parameters
     ----------
     categorical_cols : sequence of int
-        Column indices of categorical covariates used to partition samples
-        into independent subgroups (e.g. sex, batch). At most
+        Column indices of categorical covariates used to compute post-hoc
+        group corrections (e.g. sex, batch). At most
         ``RobustNormalizerConfig.MAX_CATEGORICAL`` (default 2) columns.
     continuous_cols : sequence of int
-        Column indices of continuous covariates used to model within-group
-        variation of mu and sigma (e.g. age, cell count). At most
-        ``RobustNormalizerConfig.MAX_CONTINUOUS`` (default 2) columns.
+        Column indices of the continuous covariate used to model within-group
+        variation of mu and sigma (e.g. age). Exactly one column is supported
+        (``RobustNormalizerConfig.MAX_CONTINUOUS == 1``).
     target_col : int
         Column index of the marker to be normalised. Must not appear in
         ``categorical_cols`` or ``continuous_cols``.
     n_bins : int, default=6
-        Number of equal-size bins per continuous covariate axis used to
-        estimate the polynomial surface.
+        Target number of rolling windows used to estimate the polynomial curve.
     degree : int, default=3
-        Degree of the polynomial surface fitted over the binned mu/sigma
+        Degree of the polynomial curve fitted over the window mu/sigma
         estimates. Mørkved et al. (2015) use cubic polynomials.
     n_iterations : int, default=3
-        Number of iterative Tukey z-score outlier-removal passes applied
-        to each group's data before binning.
+        Maximum number of iterative conditional outlier-removal passes applied
+        before the polynomial is finalised.
     log_transform_continuous : bool, default=False
         When ``True``, ``log10`` is applied to continuous covariate columns
         before fitting and prediction. Requires strictly positive values.
+    bin_size : int, default=120
+        Number of samples per rolling window. Mørkved et al. (2015) use 120.
 
     Attributes
     ----------
-    _models : dict of tuple -> ContinuousSurfaceFitter
-        Maps each observed categorical combination (as a tuple) to its
-        fitted :class:`ContinuousSurfaceFitter`. Populated by :meth:`fit`.
+    _combined_fitter : ContinuousSurfaceFitter
+        Single polynomial surface fitted on all data. Populated by :meth:`fit`.
+    _cat_corrections : dict of tuple -> (float, float)
+        Maps each observed categorical combination to ``(mu_cat, sigma_cat)``,
+        the mean and standard deviation of the base Z-scores within that group.
 
     Notes
     -----
@@ -439,6 +495,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         degree: int = 3,
         n_iterations: int = 3,
         log_transform_continuous: bool = False,
+        bin_size: int = 120,
     ):
         self.categorical_cols = categorical_cols
         self.continuous_cols = continuous_cols
@@ -447,7 +504,9 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         self.degree = degree
         self.n_iterations = n_iterations
         self.log_transform_continuous = log_transform_continuous
-        self._models: Dict[Tuple, ContinuousSurfaceFitter] = {}
+        self.bin_size = bin_size
+        self._combined_fitter: Optional[ContinuousSurfaceFitter] = None
+        self._cat_corrections: Dict[Tuple, Tuple[float, float]] = {}
         self._validate_constraints()
 
     def _validate_constraints(self) -> None:
@@ -466,7 +525,13 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
     def fit(
         self, X: np.ndarray, y: Optional[np.ndarray] = None
     ) -> "RobustConditionalNormalizer":
-        """Fit one surface model per categorical subgroup.
+        """Fit a single combined surface and compute per-group categorical corrections.
+
+        A single :class:`ContinuousSurfaceFitter` is fitted on the full dataset,
+        ignoring categorical group membership during curve fitting. Base Z-scores
+        are computed for every sample, then grouped by categorical combination to
+        derive ``(mu_cat, sigma_cat)`` correction parameters stored in
+        ``_cat_corrections``.
 
         Parameters
         ----------
@@ -482,36 +547,47 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             Fitted estimator.
         """
         X = np.asarray(X, dtype=float)
-        self._models.clear()
 
+        X_cont_all = X[:, list(self.continuous_cols)]
+        y_all = X[:, self.target_col]
+
+        self._combined_fitter = ContinuousSurfaceFitter(
+            n_bins=self.n_bins,
+            degree=self.degree,
+            n_iterations=self.n_iterations,
+            log_transform_continuous=self.log_transform_continuous,
+            bin_size=self.bin_size,
+        )
+        self._combined_fitter.fit(X_cont_all, y_all)
+
+        y_bc_all = boxcox(y_all, lmbda=self._combined_fitter.lambda_)
+        mu_all, sigma_all = self._combined_fitter.predict_mu_sigma(X_cont_all)
+        z_base_all = (y_bc_all - mu_all) / np.maximum(sigma_all, 1e-6)
+
+        self._cat_corrections = {}
         if not self.categorical_cols:
-            cat_groups = [(tuple(), np.arange(X.shape[0]))]
+            self._cat_corrections[tuple()] = (0.0, 1.0)
         else:
-            cat_data = X[:, self.categorical_cols]
+            cat_data = X[:, list(self.categorical_cols)]
             unique_rows, inverse_indices = np.unique(
                 cat_data, axis=0, return_inverse=True
             )
-            cat_groups = [
-                (tuple(unique_rows[i]), np.where(inverse_indices == i)[0])
-                for i in range(len(unique_rows))
-            ]
-
-        for cat_tuple, row_indices in cat_groups:
-            X_cont = X[row_indices][:, self.continuous_cols]
-            y_target = X[row_indices, self.target_col]
-            fitter = ContinuousSurfaceFitter(
-                n_bins=self.n_bins,
-                degree=self.degree,
-                n_iterations=self.n_iterations,
-                log_transform_continuous=self.log_transform_continuous,
-            )
-            fitter.fit(X_cont, y_target)
-            self._models[cat_tuple] = fitter
+            for i in range(len(unique_rows)):
+                cat_tuple = tuple(unique_rows[i])
+                z_group = z_base_all[inverse_indices == i]
+                mu_cat = float(np.mean(z_group))
+                sigma_cat = max(float(np.std(z_group)), 1e-6)
+                self._cat_corrections[cat_tuple] = (mu_cat, sigma_cat)
 
         return self
 
     def transform(self, X: np.ndarray) -> np.ndarray:
-        """Apply conditional Z-score normalization to the target column.
+        """Apply conditional Z-score normalization with post-hoc categorical correction.
+
+        Each sample's base Z-score is computed as
+        ``(BoxCox(y) - mu(x)) / sigma(x)`` using the shared polynomial surface,
+        then corrected for its categorical group:
+        ``Z_corrected = (Z_base - mu_cat) / sigma_cat``.
 
         Parameters
         ----------
@@ -522,9 +598,8 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         Returns
         -------
         X_out : ndarray of shape (n_samples, n_cols)
-            Copy of ``X`` with ``target_col`` replaced by Z-scores computed
-            as ``(BoxCox(y) - mu(x)) / sigma(x)`` where mu and sigma are in
-            Box-Cox transformed space. All other columns are unchanged.
+            Copy of ``X`` with ``target_col`` replaced by corrected Z-scores.
+            All other columns are unchanged.
 
         Warns
         -----
@@ -535,14 +610,27 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         Raises
         ------
         ValueError
-            If any target value is <= 0 for a known categorical group.
+            If any target value is <= 0.
         """
         X_out = np.copy(np.asarray(X, dtype=float))
+
+        y_raw = X_out[:, self.target_col]
+        X_cont = X_out[:, list(self.continuous_cols)]
+
+        if np.any(y_raw <= 0):
+            raise ValueError(
+                "Target values contain values <= 0; Box-Cox transform requires "
+                "strictly positive data."
+            )
+
+        y_bc = boxcox(y_raw, lmbda=self._combined_fitter.lambda_)
+        mu_pred, sigma_pred = self._combined_fitter.predict_mu_sigma(X_cont)
+        z_base = (y_bc - mu_pred) / np.maximum(sigma_pred, 1e-6)
 
         if not self.categorical_cols:
             cat_groups = [(tuple(), np.arange(X_out.shape[0]))]
         else:
-            cat_data = X_out[:, self.categorical_cols]
+            cat_data = X_out[:, list(self.categorical_cols)]
             unique_rows, inverse_indices = np.unique(
                 cat_data, axis=0, return_inverse=True
             )
@@ -552,28 +640,16 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             ]
 
         for cat_tuple, row_indices in cat_groups:
-            if cat_tuple not in self._models:
+            if cat_tuple not in self._cat_corrections:
                 warnings.warn(
                     f"Unseen categorical combination {cat_tuple}. Setting Z-scores to 0."
                 )
                 X_out[row_indices, self.target_col] = 0.0
                 continue
-
-            fitter = self._models[cat_tuple]
-            X_cont = X_out[row_indices][:, self.continuous_cols]
-            y_raw = X_out[row_indices, self.target_col]
-
-            # FIX 3e: apply Box-Cox to y_raw before computing z-scores
-            if np.any(y_raw <= 0):
-                raise ValueError(
-                    f"Target values for categorical group {cat_tuple} contain "
-                    "values <= 0; Box-Cox transform requires strictly positive data."
-                )
-            y_transformed = boxcox(y_raw, lmbda=fitter.lambda_)
-
-            mu_pred, sigma_pred = fitter.predict_mu_sigma(X_cont)
-            sigma_pred = np.maximum(sigma_pred, 1e-6)
-            X_out[row_indices, self.target_col] = (y_transformed - mu_pred) / sigma_pred
+            mu_cat, sigma_cat = self._cat_corrections[cat_tuple]
+            X_out[row_indices, self.target_col] = (
+                z_base[row_indices] - mu_cat
+            ) / sigma_cat
 
         return X_out
 
