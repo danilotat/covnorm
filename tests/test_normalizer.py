@@ -241,7 +241,7 @@ def test_two_categorical_covariates(data):
     )
     X_norm = norm.fit_transform(data)
     assert X_norm.shape == data.shape
-    assert len(norm._cat_corrections) == 2  # (sex=0,batch=0) and (sex=1,batch=1)
+    assert len(norm._cat_corrections[3]) == 2  # (sex=0,batch=0) and (sex=1,batch=1)
 
 
 # ---------------------------------------------------------------------------
