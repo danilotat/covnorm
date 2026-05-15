@@ -36,14 +36,16 @@ def _make_data(n_per_group: int = 300, rng=None) -> np.ndarray:
     if rng is None:
         rng = RNG
 
+    # Gamma distribution: right-skewed, strictly positive — required by Box-Cox.
+    # Groups differ in scale so between-group normalization correctness is verifiable.
     groups = [
-        dict(sex=0, batch=0, mu=5.0, sigma=2.0),
-        dict(sex=1, batch=1, mu=20.0, sigma=5.0),
+        dict(sex=0, batch=0, shape=4.0, scale=2.0),
+        dict(sex=1, batch=1, shape=4.0, scale=10.0),
     ]
     blocks = []
     for g in groups:
         age = rng.uniform(20, 80, n_per_group)
-        marker = rng.normal(g["mu"], g["sigma"], n_per_group)
+        marker = rng.gamma(g["shape"], g["scale"], n_per_group)
         sex = np.full(n_per_group, g["sex"])
         batch = np.full(n_per_group, g["batch"])
         blocks.append(np.column_stack([sex, batch, age, marker]))
@@ -197,7 +199,7 @@ def test_groups_are_normalized_independently(data):
     means = [np.mean(X_norm[data[:, 0] == v, 3]) for v in [0, 1]]
     stds = [np.std(X_norm[data[:, 0] == v, 3]) for v in [0, 1]]
 
-    # groups had mu=5 and mu=20 originally — after normalization both near 0
+    # groups had different gamma scales originally — after normalization both near 0
     assert abs(means[0] - means[1]) < 0.5
     assert abs(stds[0] - stds[1]) < 0.4
 
@@ -264,10 +266,11 @@ def test_unseen_category_at_transform_warns_and_zeroes(data):
 
 
 def test_constant_target_does_not_raise():
-    """sigma floor at 1e-6 must prevent division by zero."""
+    """sigma floor at 1e-6 must prevent division by zero for near-constant data."""
+    rng = np.random.default_rng(0)
     X = np.zeros((50, 3))
     X[:, 0] = np.arange(50)  # continuous covariate
-    X[:, 1] = 1.0  # constant target
+    X[:, 1] = 1.0 + rng.gamma(0.001, 0.001, 50)  # near-constant positive target
     norm = RobustConditionalNormalizer(
         categorical_cols=[], continuous_cols=[0], target_col=1
     )
@@ -284,7 +287,7 @@ def test_single_sample_per_group_falls_back(rng=RNG):
         [
             np.zeros(n),  # categorical col (single group)
             rng.uniform(0, 1, n),  # continuous col
-            rng.normal(0, 1, n),  # target
+            rng.gamma(2, 1, n),  # target: strictly positive for Box-Cox
         ]
     )
     norm = RobustConditionalNormalizer(
@@ -336,7 +339,7 @@ def test_target_col_in_continuous_raises():
 
 
 def test_surface_fitter_zero_features_uses_fallback(rng=RNG):
-    y = rng.normal(5.0, 2.0, 200)
+    y = rng.gamma(4.0, 2.0, 200)  # strictly positive for Box-Cox
     X_cont = np.empty((200, 0))
     fitter = ContinuousSurfaceFitter(n_bins=6, degree=2)
     fitter.fit(X_cont, y)
@@ -357,7 +360,7 @@ def test_surface_fitter_predict_before_fit_returns_defaults():
 
 def test_surface_fitter_sigma_strictly_positive(rng=RNG):
     X_cont = rng.uniform(0, 100, (300, 1))
-    y = rng.normal(0, 1, 300)
+    y = rng.gamma(2.0, 1.0, 300)  # strictly positive for Box-Cox
     fitter = ContinuousSurfaceFitter(n_bins=6, degree=2)
     fitter.fit(X_cont, y)
     _, sigma = fitter.predict_mu_sigma(X_cont)

@@ -2,7 +2,9 @@
 
 Scikit-learn compatible transformer for robust conditional Z-score normalization of a continuous marker against categorical and continuous covariates.
 
-For each unique combination of categorical covariates, the transformer fits a polynomial surface over mu and sigma estimated per bin via Q-Q regression with Tukey's fence outlier rejection. At transform time, each sample is normalized using the mu and sigma predicted from its covariate values.
+For each unique combination of categorical covariates, the transformer fits a polynomial surface over mu and sigma estimated per bin via Q-Q regression on Box-Cox transformed values, with iterative Tukey z-score outlier rejection. At transform time, each sample is normalized using the mu and sigma predicted from its covariate values.
+
+> **Data requirement:** target values must be strictly positive (Box-Cox transform). Shift your data if it contains zeros or negatives.
 
 Supports up to 2 categorical and 2 continuous covariates.
 
@@ -29,8 +31,8 @@ normalizer = RobustConditionalNormalizer(
     categorical_cols=[0, 1],
     continuous_cols=[2, 3],
     target_col=4,
-    n_bins=6,   # bins per continuous covariate
-    degree=2,   # polynomial degree for surface fitting
+    n_bins=6,                      # bins per continuous covariate
+    log_transform_continuous=True, # recommended when covariates span orders of magnitude
 )
 
 X_norm = normalizer.fit_transform(X)
@@ -48,4 +50,6 @@ It follows the scikit-learn `fit` / `transform` / `fit_transform` API and is com
 | `continuous_cols` | — | Column indices used as continuous covariates for surface fitting |
 | `target_col` | — | Column index of the marker to normalize |
 | `n_bins` | `6` | Number of bins per continuous covariate axis |
-| `degree` | `2` | Polynomial degree of the mu/sigma surface |
+| `degree` | `3` | Polynomial degree of the mu/sigma surface |
+| `n_iterations` | `3` | Iterative Tukey z-score outlier-removal passes before binning |
+| `log_transform_continuous` | `False` | Apply log10 to continuous covariates before fitting (recommended when they span orders of magnitude, e.g. age in years) |
