@@ -146,7 +146,7 @@ class ContinuousSurfaceFitter:
             If any value in ``y`` is <= 0, or if ``log_transform_continuous``
             is ``True`` and any continuous covariate value is <= 0.
         """
-        n_samples,  n_features = X_cont.shape
+        n_samples, n_features = X_cont.shape
 
         if self.log_transform_continuous and n_features > 0:
             for c in range(n_features):
@@ -244,7 +244,7 @@ class ContinuousSurfaceFitter:
                 np.full(X_cont.shape[0], self._global_mu),
                 np.full(X_cont.shape[0], self._global_sigma),
             )
-        #NOTE: this log10 transform is used to match the original paper implementation. Here, to ensure flexibility is leaved as an argument, but in most of the cases it should not be required
+        # NOTE: this log10 transform is used to match the original paper implementation. Here, to ensure flexibility is leaved as an argument, but in most of the cases it should not be required
         if self.log_transform_continuous:
             X_cont = np.log10(X_cont)
         X_poly = self.poly_transformer.transform(X_cont)
@@ -292,7 +292,7 @@ class ContinuousSurfaceFitter:
         if n < 2:
             return None, None
 
-        #NOTE: blom formula for computing theoretically probs, based on the gaussian assumption. While this is for keeping concordance with the original publication, would be great to eval its power and consider deviations to this, maybe with other background distributions. 
+        # NOTE: blom formula for computing theoretically probs, based on the gaussian assumption. While this is for keeping concordance with the original publication, would be great to eval its power and consider deviations to this, maybe with other background distributions.
         probs = (np.arange(1, n + 1) - 3 / 8) / (n + 1 / 4)
         z_theoretical = stats.norm.ppf(probs)
 
