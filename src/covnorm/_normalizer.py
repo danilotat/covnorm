@@ -1,6 +1,6 @@
 import warnings
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple, Dict, List
+from typing import Optional, Sequence, Tuple, Dict, List, Union
 
 import numpy as np
 import scipy.stats as stats
@@ -430,9 +430,11 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         Column indices of the continuous covariate used to model within-group
         variation of mu and sigma (e.g. age). Exactly one column is supported
         (``RobustNormalizerConfig.MAX_CONTINUOUS == 1``).
-    target_col : int
-        Column index of the marker to be normalised. Must not appear in
-        ``categorical_cols`` or ``continuous_cols``.
+    target_col : int or "all"
+        Column index of the marker to be normalised, or the string ``"all"``
+        to normalise every column that is not listed in ``categorical_cols``
+        or ``continuous_cols``. When ``"all"``, the set of target columns is
+        determined at :meth:`fit` time from the width of the input matrix.
     n_bins : int, default=6
         Target number of rolling windows used to estimate the polynomial curve.
     degree : int, default=3
@@ -449,11 +451,14 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
 
     Attributes
     ----------
-    _combined_fitter : ContinuousSurfaceFitter
-        Single polynomial surface fitted on all data. Populated by :meth:`fit`.
-    _cat_corrections : dict of tuple -> (float, float)
-        Maps each observed categorical combination to ``(mu_cat, sigma_cat)``,
-        the mean and standard deviation of the base Z-scores within that group.
+    _fitters : dict of int -> ContinuousSurfaceFitter
+        One polynomial surface per target column, populated by :meth:`fit`.
+    _cat_corrections : dict of int -> (dict of tuple -> (float, float))
+        Per-target-column mapping from categorical combination to
+        ``(mu_cat, sigma_cat)`` correction parameters.
+    _resolved_target_cols : list of int
+        The actual column indices to normalise, resolved from ``target_col``
+        during :meth:`fit`.
 
     Notes
     -----
@@ -490,7 +495,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         self,
         categorical_cols: Sequence[int],
         continuous_cols: Sequence[int],
-        target_col: int,
+        target_col: Union[int, str],
         n_bins: int = 6,
         degree: int = 3,
         n_iterations: int = 3,
@@ -505,8 +510,9 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         self.n_iterations = n_iterations
         self.log_transform_continuous = log_transform_continuous
         self.bin_size = bin_size
-        self._combined_fitter: Optional[ContinuousSurfaceFitter] = None
-        self._cat_corrections: Dict[Tuple, Tuple[float, float]] = {}
+        self._fitters: Dict[int, ContinuousSurfaceFitter] = {}
+        self._cat_corrections: Dict[int, Dict[Tuple, Tuple[float, float]]] = {}
+        self._resolved_target_cols: List[int] = []
         self._validate_constraints()
 
     def _validate_constraints(self) -> None:
@@ -518,9 +524,25 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             raise ValueError(
                 f"Exceeded max continuous covariates ({RobustNormalizerConfig.MAX_CONTINUOUS})."
             )
-        all_cols = list(self.categorical_cols) + list(self.continuous_cols)
-        if self.target_col in all_cols:
-            raise ValueError("Target column cannot be included in covariates.")
+        if self.target_col != "all":
+            if not isinstance(self.target_col, int):
+                raise ValueError(
+                    "target_col must be an integer column index or the string 'all'."
+                )
+            covariate_cols = list(self.categorical_cols) + list(self.continuous_cols)
+            if self.target_col in covariate_cols:
+                raise ValueError("Target column cannot be included in covariates.")
+
+    def _resolve_target_cols(self, n_cols: int) -> List[int]:
+        covariate_cols = set(self.categorical_cols) | set(self.continuous_cols)
+        if self.target_col == "all":
+            resolved = [c for c in range(n_cols) if c not in covariate_cols]
+            if not resolved:
+                raise ValueError(
+                    "No target columns remain after excluding covariates."
+                )
+            return resolved
+        return [int(self.target_col)]
 
     def fit(
         self, X: np.ndarray, y: Optional[np.ndarray] = None
@@ -547,37 +569,49 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             Fitted estimator.
         """
         X = np.asarray(X, dtype=float)
+        self._resolved_target_cols = self._resolve_target_cols(X.shape[1])
 
         X_cont_all = X[:, list(self.continuous_cols)]
-        y_all = X[:, self.target_col]
 
-        self._combined_fitter = ContinuousSurfaceFitter(
-            n_bins=self.n_bins,
-            degree=self.degree,
-            n_iterations=self.n_iterations,
-            log_transform_continuous=self.log_transform_continuous,
-            bin_size=self.bin_size,
-        )
-        self._combined_fitter.fit(X_cont_all, y_all)
-
-        y_bc_all = boxcox(y_all, lmbda=self._combined_fitter.lambda_)
-        mu_all, sigma_all = self._combined_fitter.predict_mu_sigma(X_cont_all)
-        z_base_all = (y_bc_all - mu_all) / np.maximum(sigma_all, 1e-6)
-
-        self._cat_corrections = {}
-        if not self.categorical_cols:
-            self._cat_corrections[tuple()] = (0.0, 1.0)
-        else:
+        if self.categorical_cols:
             cat_data = X[:, list(self.categorical_cols)]
             unique_rows, inverse_indices = np.unique(
                 cat_data, axis=0, return_inverse=True
             )
-            for i in range(len(unique_rows)):
-                cat_tuple = tuple(unique_rows[i])
-                z_group = z_base_all[inverse_indices == i]
-                mu_cat = float(np.mean(z_group))
-                sigma_cat = max(float(np.std(z_group)), 1e-6)
-                self._cat_corrections[cat_tuple] = (mu_cat, sigma_cat)
+        else:
+            unique_rows = inverse_indices = None
+
+        self._fitters = {}
+        self._cat_corrections = {}
+
+        for col in self._resolved_target_cols:
+            y_all = X[:, col]
+
+            fitter = ContinuousSurfaceFitter(
+                n_bins=self.n_bins,
+                degree=self.degree,
+                n_iterations=self.n_iterations,
+                log_transform_continuous=self.log_transform_continuous,
+                bin_size=self.bin_size,
+            )
+            fitter.fit(X_cont_all, y_all)
+            self._fitters[col] = fitter
+
+            y_bc_all = boxcox(y_all, lmbda=fitter.lambda_)
+            mu_all, sigma_all = fitter.predict_mu_sigma(X_cont_all)
+            z_base_all = (y_bc_all - mu_all) / np.maximum(sigma_all, 1e-6)
+
+            col_corrections: Dict[Tuple, Tuple[float, float]] = {}
+            if not self.categorical_cols:
+                col_corrections[tuple()] = (0.0, 1.0)
+            else:
+                for i in range(len(unique_rows)):
+                    cat_tuple = tuple(unique_rows[i])
+                    z_group = z_base_all[inverse_indices == i]
+                    mu_cat = float(np.mean(z_group))
+                    sigma_cat = max(float(np.std(z_group)), 1e-6)
+                    col_corrections[cat_tuple] = (mu_cat, sigma_cat)
+            self._cat_corrections[col] = col_corrections
 
         return self
 
@@ -613,19 +647,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             If any target value is <= 0.
         """
         X_out = np.copy(np.asarray(X, dtype=float))
-
-        y_raw = X_out[:, self.target_col]
         X_cont = X_out[:, list(self.continuous_cols)]
-
-        if np.any(y_raw <= 0):
-            raise ValueError(
-                "Target values contain values <= 0; Box-Cox transform requires "
-                "strictly positive data."
-            )
-
-        y_bc = boxcox(y_raw, lmbda=self._combined_fitter.lambda_)
-        mu_pred, sigma_pred = self._combined_fitter.predict_mu_sigma(X_cont)
-        z_base = (y_bc - mu_pred) / np.maximum(sigma_pred, 1e-6)
 
         if not self.categorical_cols:
             cat_groups = [(tuple(), np.arange(X_out.shape[0]))]
@@ -639,17 +661,31 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
                 for i in range(len(unique_rows))
             ]
 
-        for cat_tuple, row_indices in cat_groups:
-            if cat_tuple not in self._cat_corrections:
-                warnings.warn(
-                    f"Unseen categorical combination {cat_tuple}. Setting Z-scores to 0."
+        for col in self._resolved_target_cols:
+            y_raw = X_out[:, col]
+
+            if np.any(y_raw <= 0):
+                raise ValueError(
+                    f"Column {col} contains values <= 0; Box-Cox transform requires "
+                    "strictly positive data."
                 )
-                X_out[row_indices, self.target_col] = 0.0
-                continue
-            mu_cat, sigma_cat = self._cat_corrections[cat_tuple]
-            X_out[row_indices, self.target_col] = (
-                z_base[row_indices] - mu_cat
-            ) / sigma_cat
+
+            fitter = self._fitters[col]
+            y_bc = boxcox(y_raw, lmbda=fitter.lambda_)
+            mu_pred, sigma_pred = fitter.predict_mu_sigma(X_cont)
+            z_base = (y_bc - mu_pred) / np.maximum(sigma_pred, 1e-6)
+
+            col_corrections = self._cat_corrections[col]
+            for cat_tuple, row_indices in cat_groups:
+                if cat_tuple not in col_corrections:
+                    warnings.warn(
+                        f"Unseen categorical combination {cat_tuple} for column {col}. "
+                        "Setting Z-scores to 0."
+                    )
+                    X_out[row_indices, col] = 0.0
+                    continue
+                mu_cat, sigma_cat = col_corrections[cat_tuple]
+                X_out[row_indices, col] = (z_base[row_indices] - mu_cat) / sigma_cat
 
         return X_out
 
