@@ -1,11 +1,3 @@
-# Fixes applied against Mørkved et al. (2015), Clinical Chemistry 61:5, 760-768:
-# FIX 1 — Equal-size (quantile) bins per covariate axis (§ Methods, binning)
-# FIX 2 — Blom plotting positions recomputed for the actual surviving sample count (§ App. A)
-# FIX 3 — Box-Cox transform of marker values before Q-Q regression (§ Methods, eq. 3-4)
-# FIX 4 — Tukey fence in z-score space (factor 2 ↔ |z|>3.372) with iterative loop (§ Methods)
-# FIX 5 — log10 transform of continuous covariates before polynomial fitting (§ Methods)
-# FIX 6 — MIN_BIN_SAMPLES raised from 5 to 30 (paper uses ~120; 30 is practical minimum)
-# FIX 7 — Polynomial degree default raised from 2 to 3 (§ Results, cubic polynomials)
 import warnings
 from dataclasses import dataclass
 from itertools import product
@@ -40,7 +32,7 @@ class RobustNormalizerConfig:
 
     MAX_CATEGORICAL: int = 2
     MAX_CONTINUOUS: int = 2
-    MIN_BIN_SAMPLES: int = 30  # FIX 6: raised from 5
+    MIN_BIN_SAMPLES: int = 30
 
 
 class ContinuousSurfaceFitter:
@@ -156,7 +148,6 @@ class ContinuousSurfaceFitter:
         """
         n_samples, n_features = X_cont.shape
 
-        # FIX 5b: log10-transform continuous covariates before any binning
         if self.log_transform_continuous and n_features > 0:
             for c in range(n_features):
                 if np.any(X_cont[:, c] <= 0):
@@ -172,11 +163,9 @@ class ContinuousSurfaceFitter:
                 "positive data. Shift the data before fitting."
             )
 
-        # FIX 3c: find lambda_ once on the full group y
         if self.lambda_ is None:
             self.lambda_ = float(boxcox_normmax(y))
 
-        # FIX 4c: iterative Tukey z-score outlier removal on full group data
         y_clean = y.copy()
         X_cont_clean = X_cont.copy()
         for _ in range(self.n_iterations):
@@ -192,13 +181,13 @@ class ContinuousSurfaceFitter:
             return self
 
         n_clean = len(y_clean)
-        # FIX 1: equal-size (quantile) bin edges, computed from cleaned data
+        # equal size bins. Note that this diverges from the previous implementation where bins where computed using np.linspace, thus not quantiles.
         bin_edges = [
             np.quantile(X_cont_clean[:, c], np.linspace(0, 1, self.n_bins + 1))
             for c in range(n_features)
         ]
         valid_centers, mu_estimates, sigma_estimates = [], [], []
-
+        # that's the core of covnorm. Here we're doing iteratively the computation for each bins in each feature.
         for bin_indices in product(*(range(self.n_bins) for _ in range(n_features))):
             mask = np.ones(n_clean, dtype=bool)
             centers = []
@@ -255,7 +244,7 @@ class ContinuousSurfaceFitter:
                 np.full(X_cont.shape[0], self._global_mu),
                 np.full(X_cont.shape[0], self._global_sigma),
             )
-        # FIX 5b: apply the same log10 transform used during fit
+        # NOTE: this log10 transform is used to match the original paper implementation. Here, to ensure flexibility is leaved as an argument, but in most of the cases it should not be required
         if self.log_transform_continuous:
             X_cont = np.log10(X_cont)
         X_poly = self.poly_transformer.transform(X_cont)
@@ -297,13 +286,13 @@ class ContinuousSurfaceFitter:
                 "bin_data contains values <= 0; shift the data before "
                 "applying Box-Cox."
             )
-        # FIX 3b: apply Box-Cox before sorting and regression
+        # this apply box-cox transforming before doing sort-regression
         bin_data_bc = np.sort(boxcox(bin_data, lmbda=lambda_))
         n = len(bin_data_bc)
         if n < 2:
             return None, None
 
-        # FIX 2: Blom formula computed for the actual n (no masking)
+        # NOTE: blom formula for computing theoretically probs, based on the gaussian assumption. While this is for keeping concordance with the original publication, would be great to eval its power and consider deviations to this, maybe with other background distributions.
         probs = (np.arange(1, n + 1) - 3 / 8) / (n + 1 / 4)
         z_theoretical = stats.norm.ppf(probs)
 
@@ -618,7 +607,6 @@ if __name__ == "__main__":
     )
     X_out = norm.fit_transform(X)
 
-    # 4. shape preserved
     assert X_out.shape == X.shape, f"Shape mismatch: {X_out.shape} != {X.shape}"
 
     for group_id in (0, 1):
@@ -626,7 +614,6 @@ if __name__ == "__main__":
         z = X_out[mask, 2]
         mean_z = float(np.mean(z))
         std_z = float(np.std(z))
-        # 3. mean within 0.1 of 0 and std within 0.2 of 1
         assert (
             abs(mean_z) < 0.1
         ), f"Group {group_id}: mean z = {mean_z:.4f}, expected |mean| < 0.1"
