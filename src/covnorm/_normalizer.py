@@ -245,9 +245,7 @@ class ContinuousSurfaceFitter:
         X_poly = self.poly_transformer.transform(X_cont)
         return self.mu_model.predict(X_poly), self.sigma_model.predict(X_poly)
 
-    def _find_lambda_grid_search(
-        self, y: np.ndarray, n_points: int = 41
-    ) -> float:
+    def _find_lambda_grid_search(self, y: np.ndarray, n_points: int = 41) -> float:
         """Find Box-Cox lambda that maximises Q-Q linearity (Pearson R).
 
         Evaluates the Pearson correlation between sorted ``BoxCox(y, lam)``
