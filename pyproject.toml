@@ -24,6 +24,7 @@ dependencies = [
     "numpy>=1.26",
     "scipy>=1.12",
     "scikit-learn>=1.4",
+    "matplotlib>=3.7",
 ]
 
 [project.urls]
