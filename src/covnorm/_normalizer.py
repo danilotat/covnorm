@@ -512,6 +512,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         self.bin_size = bin_size
         self._fitters: Dict[int, ContinuousSurfaceFitter] = {}
         self._cat_corrections: Dict[int, Dict[Tuple, Tuple[float, float]]] = {}
+        self._cat_encoders: Dict[int, Dict] = {}
         self._resolved_target_cols: List[int] = []
         self._validate_constraints()
 
@@ -532,6 +533,21 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             covariate_cols = list(self.categorical_cols) + list(self.continuous_cols)
             if self.target_col in covariate_cols:
                 raise ValueError("Target column cannot be included in covariates.")
+
+    def _encode(self, X: np.ndarray, fit: bool = False) -> np.ndarray:
+        X = np.asarray(X)
+        if X.dtype.kind in "iufcb":
+            return X.astype(float)
+        if fit:
+            self._cat_encoders = {
+                c: {v: float(i) for i, v in enumerate(sorted(set(X[:, c]), key=str))}
+                for c in self.categorical_cols
+            }
+        out = np.empty(X.shape, dtype=float)
+        for j in range(X.shape[1]):
+            enc = self._cat_encoders.get(j)
+            out[:, j] = [enc[v] for v in X[:, j]] if enc else X[:, j].astype(float)
+        return out
 
     def _resolve_target_cols(self, n_cols: int) -> List[int]:
         covariate_cols = set(self.categorical_cols) | set(self.continuous_cols)
@@ -568,7 +584,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         self : RobustConditionalNormalizer
             Fitted estimator.
         """
-        X = np.asarray(X, dtype=float)
+        X = self._encode(X, fit=True)
         self._resolved_target_cols = self._resolve_target_cols(X.shape[1])
 
         X_cont_all = X[:, list(self.continuous_cols)]
@@ -646,7 +662,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         ValueError
             If any target value is <= 0.
         """
-        X_out = np.copy(np.asarray(X, dtype=float))
+        X_out = self._encode(X)
         X_cont = X_out[:, list(self.continuous_cols)]
 
         if not self.categorical_cols:
