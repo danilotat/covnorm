@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 from scipy.stats import boxcox
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.utils.validation import validate_data
 
 from covnorm._surface_fitter import ContinuousSurfaceFitter, RobustNormalizerConfig
 
@@ -192,6 +193,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             Fitted estimator.
         """
         X = self._encode(X, fit=True)
+        validate_data(self, X, reset=True)
         self._resolved_target_cols = self._resolve_target_cols(X.shape[1])
 
         X_cont_all = X[:, list(self.continuous_cols)]
@@ -270,6 +272,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             If any target value is <= 0.
         """
         X_out = self._encode(X)
+        validate_data(self, X_out, reset=False)
         X_cont = X_out[:, list(self.continuous_cols)]
 
         if not self.categorical_cols:
