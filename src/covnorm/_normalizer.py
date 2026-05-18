@@ -1,12 +1,13 @@
 import warnings
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple, Dict, List, Union
-
 import numpy as np
 import scipy.stats as stats
 from scipy.stats import boxcox
 from sklearn.base import BaseEstimator, TransformerMixin
+from math import comb
 from sklearn.linear_model import LinearRegression
+from sklearn.neighbors import KDTree
 from sklearn.preprocessing import PolynomialFeatures
 
 
@@ -21,9 +22,9 @@ class RobustNormalizerConfig:
         :class:`RobustConditionalNormalizer`.
     MAX_CONTINUOUS : int
         Maximum number of continuous covariates accepted by
-        :class:`RobustConditionalNormalizer`. Restricted to 1 to avoid
-        the curse of dimensionality inherent in multi-dimensional grid binning
-        (ADHERENCE Fix 4).
+        :class:`RobustConditionalNormalizer`. One covariate uses 1D rolling
+        windows; two covariates use k-NN overlapping windows in the scaled
+        2D space, which avoids the curse of dimensionality (ADHERENCE Fix 4).
     MIN_BIN_SAMPLES : int
         Minimum number of samples required in a bin to attempt
         Q-Q regression. Bins below this threshold are skipped.
@@ -32,17 +33,18 @@ class RobustNormalizerConfig:
     """
 
     MAX_CATEGORICAL: int = 2
-    MAX_CONTINUOUS: int = 1
+    MAX_CONTINUOUS: int = 2
     MIN_BIN_SAMPLES: int = 30
 
 
 class ContinuousSurfaceFitter:
-    """Polynomial surface model for mu and sigma over a single continuous covariate.
+    """Polynomial surface model for mu and sigma over one or two continuous covariates.
 
-    Sorts the data by the continuous covariate, creates rolling overlapping
-    windows of a fixed number of samples (``bin_size``), estimates mu and sigma
-    per window via Q-Q regression on Box-Cox transformed data, then fits a
-    polynomial curve through the valid window estimates. At prediction time the
+    For one covariate, sorts the data and creates rolling overlapping windows of
+    ``bin_size`` samples, estimates mu and sigma per window via Q-Q regression on
+    Box-Cox transformed data, then fits a polynomial curve through the window
+    estimates.  For two covariates, k-NN overlapping windows of ``bin_size``
+    nearest neighbours in the scaled 2D space are used instead. At prediction time the
     curve is evaluated at the exact covariate values of each sample.
 
     Outlier removal is iterative and conditional: after each polynomial fit the
@@ -141,7 +143,7 @@ class ContinuousSurfaceFitter:
         X_cont : ndarray of shape (n_samples, n_features)
             Continuous covariate matrix. Pass an array with zero columns
             (``n_features == 0``) to trigger the global fallback.
-            Must have at most one column (``n_features <= 1``).
+            Accepts one or two columns; two-column input uses k-NN binning.
             All values must be strictly positive when
             ``log_transform_continuous=True``.
         y : ndarray of shape (n_samples,)
@@ -187,11 +189,18 @@ class ContinuousSurfaceFitter:
         X_work = X_cont.copy()
 
         for _ in range(self.n_iterations):
-            valid_centers, mu_estimates, sigma_estimates = self._create_rolling_bins(
-                X_work[:, 0], y_work
-            )
+            if X_work.shape[1] == 1:
+                valid_centers, mu_estimates, sigma_estimates = self._create_rolling_bins(
+                    X_work[:, 0], y_work
+                )
+            else:
+                valid_centers, mu_estimates, sigma_estimates = self._create_knn_bins(
+                    X_work, y_work
+                )
 
-            if len(valid_centers) < (self.degree + 1):
+            n_features = X_work.shape[1]
+            min_centers = comb(self.degree + n_features, n_features)
+            if len(valid_centers) < min_centers:
                 warnings.warn(
                     "Too few valid bins for stable polynomial fitting. "
                     "Falling back to global estimates."
@@ -334,6 +343,63 @@ class ContinuousSurfaceFitter:
 
         return valid_centers, mu_estimates, sigma_estimates
 
+    def _create_knn_bins(
+        self, X: np.ndarray, y: np.ndarray
+    ) -> Tuple[List, List, List]:
+        """Build k-NN overlapping windows for a 2D continuous covariate space.
+
+        Selects ``n_bins`` reference points by sorting data along a 1D projection
+        (sum of scaled columns) and taking evenly-spaced rank positions.  For each
+        reference point the ``bin_size`` nearest neighbours in the scaled 2D space
+        form a bin.  This avoids grid-based binning and the curse of dimensionality.
+
+        Parameters
+        ----------
+        X : ndarray of shape (n_samples, 2)
+            Continuous covariate matrix (already log-transformed if applicable).
+        y : ndarray of shape (n_samples,)
+            Target values, strictly positive.
+
+        Returns
+        -------
+        valid_centers : list of list[float]
+            Median covariate values per valid window, shape (n_valid, 2).
+        mu_estimates : list of float
+        sigma_estimates : list of float
+        """
+        n = len(y)
+        x_std = X.std(axis=0)
+        x_std[x_std < 1e-8] = 1.0
+        X_scaled = (X - X.mean(axis=0)) / x_std
+
+        projection = X_scaled.sum(axis=1)
+        proj_sorted_idx = np.argsort(projection)
+        ref_positions = np.round(np.linspace(0, n - 1, self.n_bins)).astype(int)
+        ref_idx = np.unique(proj_sorted_idx[ref_positions])
+
+        k = min(self.bin_size, n)
+        tree = KDTree(X_scaled)
+
+        valid_centers: List = []
+        mu_estimates: List = []
+        sigma_estimates: List = []
+
+        for idx in ref_idx:
+            neighbor_idx = tree.query(X_scaled[[idx]], k=k, return_distance=False)[0]
+            bin_y = y[neighbor_idx]
+            bin_X = X[neighbor_idx]
+            if len(bin_y) < RobustNormalizerConfig.MIN_BIN_SAMPLES:
+                continue
+            mu, sigma = self._robust_qq_estimation(bin_y, self.lambda_)
+            if mu is not None and sigma is not None:
+                valid_centers.append(
+                    [float(np.median(bin_X[:, 0])), float(np.median(bin_X[:, 1]))]
+                )
+                mu_estimates.append(mu)
+                sigma_estimates.append(sigma)
+
+        return valid_centers, mu_estimates, sigma_estimates
+
     def _robust_qq_estimation(
         self, bin_data: np.ndarray, lambda_: float
     ) -> Tuple[Optional[float], Optional[float]]:
@@ -427,9 +493,13 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         group corrections (e.g. sex, batch). At most
         ``RobustNormalizerConfig.MAX_CATEGORICAL`` (default 2) columns.
     continuous_cols : sequence of int
-        Column indices of the continuous covariate used to model within-group
-        variation of mu and sigma (e.g. age). Exactly one column is supported
-        (``RobustNormalizerConfig.MAX_CONTINUOUS == 1``).
+        Column indices of continuous covariates used to model within-group
+        variation of mu and sigma (e.g. age, BMI). Up to two columns are
+        supported; one column uses 1D rolling windows, two columns use k-NN
+        windows (``RobustNormalizerConfig.MAX_CONTINUOUS == 2``).
+        When two columns are used, set ``n_bins >= 10`` so that the number
+        of valid centers meets the minimum for a degree-3 surface polynomial
+        (``comb(3+2, 2) == 10`` terms).
     target_col : int or "all"
         Column index of the marker to be normalised, or the string ``"all"``
         to normalise every column that is not listed in ``categorical_cols``

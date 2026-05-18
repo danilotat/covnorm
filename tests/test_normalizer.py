@@ -319,6 +319,25 @@ def test_too_many_continuous_raises():
         )
 
 
+def test_two_continuous_covariates():
+    rng = np.random.default_rng(7)
+    n = 600
+    X = np.column_stack([
+        rng.integers(0, 2, n).astype(float),
+        rng.uniform(20, 80, n),
+        rng.uniform(1, 50, n),
+        rng.gamma(4.0, 2.0, n),
+    ])
+    norm = RobustConditionalNormalizer(
+        categorical_cols=[0], continuous_cols=[1, 2], target_col=3, n_bins=10
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        X_norm = norm.fit_transform(X)
+    assert X_norm.shape == X.shape
+    assert np.all(np.isfinite(X_norm[:, 3]))
+
+
 def test_target_col_in_categorical_raises():
     with pytest.raises(ValueError, match="Target column cannot be included"):
         RobustConditionalNormalizer(
