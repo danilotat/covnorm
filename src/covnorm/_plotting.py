@@ -89,7 +89,9 @@ def plot_covariate_space(
     for k, cont_col in enumerate(cont_cols):
         ax = axes[k]
 
-        ax.scatter(X[:, cont_col], y_raw, s=5, alpha=0.3, color="steelblue", linewidths=0)
+        ax.scatter(
+            X[:, cont_col], y_raw, s=5, alpha=0.3, color="steelblue", linewidths=0
+        )
 
         x_min, x_max = X[:, cont_col].min(), X[:, cont_col].max()
         x_grid = np.linspace(x_min, x_max, n_grid)
@@ -114,8 +116,11 @@ def plot_covariate_space(
         y_lower = inv_boxcox(bc_lower, lambda_)
 
         ax.fill_between(
-            x_grid, y_lower, y_upper,
-            alpha=0.35, color="tomato",
+            x_grid,
+            y_lower,
+            y_upper,
+            alpha=0.35,
+            color="tomato",
             label=f"μ ± {n_sigma}σ",
         )
         ax.plot(x_grid, y_center, lw=2, color="tomato", label="μ(x)")
@@ -138,7 +143,9 @@ def plot_covariate_space(
                 if covariate_labels is not None and (1 - k) < len(covariate_labels)
                 else f"col {cont_cols[1 - k]}"
             )
-            ax.set_title(f"{other_label} fixed at median ({median_val:.2g})", fontsize=9)
+            ax.set_title(
+                f"{other_label} fixed at median ({median_val:.2g})", fontsize=9
+            )
 
     fig.tight_layout()
     return fig
