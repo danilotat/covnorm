@@ -190,8 +190,8 @@ class ContinuousSurfaceFitter:
 
         for _ in range(self.n_iterations):
             if X_work.shape[1] == 1:
-                valid_centers, mu_estimates, sigma_estimates = self._create_rolling_bins(
-                    X_work[:, 0], y_work
+                valid_centers, mu_estimates, sigma_estimates = (
+                    self._create_rolling_bins(X_work[:, 0], y_work)
                 )
             else:
                 valid_centers, mu_estimates, sigma_estimates = self._create_knn_bins(
@@ -343,9 +343,7 @@ class ContinuousSurfaceFitter:
 
         return valid_centers, mu_estimates, sigma_estimates
 
-    def _create_knn_bins(
-        self, X: np.ndarray, y: np.ndarray
-    ) -> Tuple[List, List, List]:
+    def _create_knn_bins(self, X: np.ndarray, y: np.ndarray) -> Tuple[List, List, List]:
         """Build k-NN overlapping windows for a 2D continuous covariate space.
 
         Selects ``n_bins`` reference points by sorting data along a 1D projection
