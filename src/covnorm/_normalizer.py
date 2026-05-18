@@ -554,9 +554,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         if self.target_col == "all":
             resolved = [c for c in range(n_cols) if c not in covariate_cols]
             if not resolved:
-                raise ValueError(
-                    "No target columns remain after excluding covariates."
-                )
+                raise ValueError("No target columns remain after excluding covariates.")
             return resolved
         return [int(self.target_col)]
 
