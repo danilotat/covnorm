@@ -2,7 +2,6 @@ import warnings
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
-from scipy.stats import boxcox, yeojohnson
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import validate_data
 
@@ -229,14 +228,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             )
             fitter.fit(X_cont_all, y_all)
             self._fitters[col] = fitter
-            if np.any(y_all == 0):
-                if self.zero_handles.lower() == "eps":
-                    y_all = y_all + 1e-6
-                    y_bc_all = boxcox(y_all, lmbda=fitter.lambda_)
-                elif self.zero_handles.lower() == "yeojohnson":
-                    y_bc_all = yeojohnson(y_all, lmbda=fitter.lambda_)
-            else:
-                y_bc_all = boxcox(y_all, lmbda=fitter.lambda_)
+            y_bc_all = fitter._transform(y_all, fitter.lambda_)
 
             mu_all, sigma_all = fitter.predict_mu_sigma(X_cont_all)
             z_base_all = (y_bc_all - mu_all) / np.maximum(sigma_all, 1e-6)
@@ -281,10 +273,6 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             Raised for any categorical combination not seen during
             :meth:`fit`. Affected samples receive a Z-score of 0.
 
-        Raises
-        ------
-        ValueError
-            If any target value is <= 0.
         """
         X_out = self._encode(X)
         validate_data(self, X_out, reset=False)
@@ -304,24 +292,8 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
 
         for col in self._resolved_target_cols:
             y_raw = X_out[:, col]
-
-            if np.any(y_raw < 0) or (
-                self.zero_handles.lower() == "eps" and np.any(y_raw == 0)
-            ):
-                raise ValueError(
-                    f"Column {col} contains non-positive values; Box-Cox requires "
-                    "strictly positive data. Use zero_handles='yeojohnson' if zeros are present."
-                )
-
             fitter = self._fitters[col]
-            if np.any(y_raw == 0):
-                if self.zero_handles.lower() == "eps":
-                    y_raw = y_raw + 1e-6
-                    y_bc = boxcox(y_raw, lmbda=fitter.lambda_)
-                elif self.zero_handles.lower() == "yeojohnson":
-                    y_bc = yeojohnson(y_raw, lmbda=fitter.lambda_)
-            else:
-                y_bc = boxcox(y_raw, lmbda=fitter.lambda_)
+            y_bc = fitter._transform(y_raw, fitter.lambda_)
 
             mu_pred, sigma_pred = fitter.predict_mu_sigma(X_cont)
             z_base = (y_bc - mu_pred) / np.maximum(sigma_pred, 1e-6)
