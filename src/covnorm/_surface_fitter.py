@@ -138,11 +138,7 @@ class ContinuousSurfaceFitter:
         self._global_mu: float = 0.0
         self._global_sigma: float = 1.0
         self._is_fitted: bool = False
-        self.zero_handles = zero_handles.lower()
-        assert self.zero_handles in (
-            "eps",
-            "yeojohnson",
-        ), "Acceptable values for zero_handles are `eps` or `yeojohnson`."
+        self.zero_handles = zero_handles
 
     def fit(self, X_cont: np.ndarray, y: np.ndarray) -> "ContinuousSurfaceFitter":
         """Fit the polynomial mu/sigma curve to rolling window estimates.
@@ -226,7 +222,7 @@ class ContinuousSurfaceFitter:
             mu_pred = self.mu_model.predict(X_poly_work)
             sigma_pred = np.maximum(self.sigma_model.predict(X_poly_work), 1e-6)
             if np.any(y_work == 0):
-                if self.zero_handles == "eps":
+                if self.zero_handles.lower() == 'eps':
                     y_work = y_work + 1e-6
                     y_bc = boxcox(y_work, lmbda=self.lambda_)
                 else:
