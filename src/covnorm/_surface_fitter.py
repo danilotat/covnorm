@@ -103,6 +103,13 @@ class ContinuousSurfaceFitter:
     _is_fitted : bool
         ``True`` if the polynomial surface was successfully fitted,
         ``False`` if the fallback values are in use.
+    bin_centers_ : ndarray of shape (n_bins, n_features) or None
+        Covariate coordinates of each valid bin used in the final fitting
+        iteration. ``None`` until :meth:`fit` is called with a surface fit.
+    bin_mu_ : ndarray of shape (n_bins,) or None
+        Q-Q regression mu estimate for each bin in ``bin_centers_``.
+    bin_sigma_ : ndarray of shape (n_bins,) or None
+        Q-Q regression sigma estimate for each bin in ``bin_centers_``.
 
     Notes
     -----
@@ -139,6 +146,9 @@ class ContinuousSurfaceFitter:
         self._global_sigma: float = 1.0
         self._is_fitted: bool = False
         self.zero_handles = zero_handles
+        self.bin_centers_: Optional[np.ndarray] = None
+        self.bin_mu_: Optional[np.ndarray] = None
+        self.bin_sigma_: Optional[np.ndarray] = None
 
     def fit(self, X_cont: np.ndarray, y: np.ndarray) -> "ContinuousSurfaceFitter":
         """Fit the polynomial mu/sigma curve to rolling window estimates.
@@ -211,6 +221,9 @@ class ContinuousSurfaceFitter:
             self.mu_model.fit(X_poly, mu_estimates)
             self.sigma_model.fit(X_poly, sigma_estimates)
             self._is_fitted = True
+            self.bin_centers_ = np.array(valid_centers)
+            self.bin_mu_ = np.array(mu_estimates)
+            self.bin_sigma_ = np.array(sigma_estimates)
 
             X_poly_work = self.poly_transformer.transform(X_work)
             mu_pred = self.mu_model.predict(X_poly_work)
