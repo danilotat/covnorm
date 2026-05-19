@@ -215,14 +215,7 @@ class ContinuousSurfaceFitter:
             X_poly_work = self.poly_transformer.transform(X_work)
             mu_pred = self.mu_model.predict(X_poly_work)
             sigma_pred = np.maximum(self.sigma_model.predict(X_poly_work), 1e-6)
-            if np.any(y_work == 0):
-                if self.zero_handles.lower() == "eps":
-                    y_work = y_work + 1e-6
-                    y_bc = boxcox(y_work, lmbda=self.lambda_)
-                else:
-                    y_bc = yeojohnson(y_work, lmbda=self.lambda_)
-            else:
-                y_bc = boxcox(y_work, lmbda=self.lambda_)
+            y_bc = self._transform(y_work, self.lambda_)
 
             z = (y_bc - mu_pred) / sigma_pred
             mask = np.abs(z) <= 3.372
@@ -261,6 +254,15 @@ class ContinuousSurfaceFitter:
         X_poly = self.poly_transformer.transform(X_cont)
         return self.mu_model.predict(X_poly), self.sigma_model.predict(X_poly)
 
+    def _transform(self, data: np.ndarray, lambda_: float) -> np.ndarray:
+        """Apply Box-Cox or Yeo-Johnson transform, honouring zero_handles."""
+        if np.any(data <= 0):
+            if self.zero_handles.lower() == "eps":
+                return boxcox(data + 1e-6, lmbda=lambda_)
+            else:
+                return yeojohnson(data, lmbda=lambda_)
+        return boxcox(data, lmbda=lambda_)
+
     def _find_lambda_grid_search(self, y: np.ndarray, n_points: int = 41) -> float:
         """Find Box-Cox lambda that maximises Q-Q linearity (Pearson R).
 
@@ -288,7 +290,7 @@ class ContinuousSurfaceFitter:
         best_r = -np.inf
         for lam in lambdas:
             try:
-                y_bc = np.sort(boxcox(y, lmbda=lam))
+                y_bc = np.sort(self._transform(y, lam))
             except Exception:
                 continue
             r = float(np.corrcoef(z_theoretical, y_bc)[0, 1])
@@ -430,18 +432,8 @@ class ContinuousSurfaceFitter:
         sigma : float or None
             Estimated scale in Box-Cox space, floored at ``1e-6``. ``None``
             if estimation is not possible.
-
-        Raises
-        ------
-        ValueError
-            If any value in ``bin_data`` is <= 0.
         """
-        if np.any(bin_data <= 0):
-            raise ValueError(
-                "bin_data contains values <= 0; shift the data before "
-                "applying Box-Cox."
-            )
-        bin_data_bc = np.sort(boxcox(bin_data, lmbda=lambda_))
+        bin_data_bc = np.sort(self._transform(bin_data, lambda_))
         n = len(bin_data_bc)
         if n < 2:
             return None, None
@@ -465,7 +457,7 @@ class ContinuousSurfaceFitter:
         """
         mu, sigma = self._robust_qq_estimation(y, self.lambda_)
         if mu is None or sigma is None:
-            y_bc = boxcox(y, lmbda=self.lambda_)
+            y_bc = self._transform(y, self.lambda_)
             self._global_mu = float(np.mean(y_bc))
             self._global_sigma = max(float(np.std(y_bc)), 1e-6)
         else:
