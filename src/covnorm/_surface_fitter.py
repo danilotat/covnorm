@@ -161,8 +161,8 @@ class ContinuousSurfaceFitter:
         Raises
         ------
         ValueError
-            If any value in ``y`` is <= 0, or if ``log_transform_continuous``
-            is ``True`` and any continuous covariate value is <= 0.
+            If ``log_transform_continuous`` is ``True`` and any continuous
+            covariate value is <= 0.
         """
         n_samples, n_features = X_cont.shape
 
@@ -174,12 +174,6 @@ class ContinuousSurfaceFitter:
                         f"covariate values; column {c} contains values <= 0."
                     )
             X_cont = np.log10(X_cont)
-
-        if np.any(y <= 0):
-            raise ValueError(
-                "y contains values <= 0; Box-Cox transform requires strictly "
-                "positive data. Shift the data before fitting."
-            )
 
         if self.lambda_ is None:
             self.lambda_ = self._find_lambda_grid_search(y)
