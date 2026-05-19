@@ -208,7 +208,9 @@ def _plot_surface_3d(
             )
             seg_colors.append(cmap(norm((mu_surface[i0, j] + mu_surface[i1, j]) / 2)))
 
-    ax.add_collection3d(Line3DCollection(segments, colors=seg_colors, linewidths=0.6, alpha=.6))
+    ax.add_collection3d(
+        Line3DCollection(segments, colors=seg_colors, linewidths=0.6, alpha=0.6)
+    )
 
     ax.scatter(
         X[:, cont_cols[0]],
