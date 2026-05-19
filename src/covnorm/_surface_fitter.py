@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import scipy.stats as stats
-from scipy.stats import boxcox
+from scipy.stats import boxcox, yeojohnson
 from sklearn.linear_model import LinearRegression
 from sklearn.neighbors import KDTree
 from sklearn.preprocessing import PolynomialFeatures
@@ -65,9 +65,8 @@ class ContinuousSurfaceFitter:
         Degree of the polynomial curve fitted to the window estimates.
         Mørkved et al. (2015) use cubic polynomials.
     lambda_ : float or None, default=None
-        Box-Cox transformation parameter. When ``None`` the optimal value
-        is found via a grid search over [-2, 2] that maximises the Pearson
-        correlation between sorted BoxCox(y) values and their theoretical
+        Box-Cox transformation (or Jeo-Yohnson) parameter. When ``None`` the
+        optimal value is found via a grid search over [-2, 2] that maximises the Pearson correlation between sorted BoxCox(y) values and their theoretical
         normal quantiles (Q-Q linearity). When provided, that value is used
         directly and stored unchanged.
     n_iterations : int, default=3
@@ -80,6 +79,10 @@ class ContinuousSurfaceFitter:
         Requires all covariate values to be strictly positive.
     bin_size : int, default=120
         Number of samples per rolling window. Mørkved et al. (2015) use 120.
+    zero_handles: str, default=`eps`
+        Strategy to handles zeros in input data. The default behavior is to use
+        Box-Cox transformations, but in case of values equal to 0, the method
+        will use any of the strategy here. Could be one of `eps`, `yeojohnson`
 
     Attributes
     ----------
@@ -90,7 +93,7 @@ class ContinuousSurfaceFitter:
     sigma_model : sklearn.linear_model.LinearRegression
         Linear model predicting sigma (in Box-Cox space) from polynomial features.
     lambda_ : float
-        Box-Cox parameter; ``None`` until :meth:`fit` is called.
+        Box-Cox (or Jeo-Yohnson) parameter; ``None`` until :meth:`fit` is called.
     _global_mu : float
         Fallback mu (in Box-Cox space) used when the polynomial surface
         cannot be fitted.
@@ -104,8 +107,8 @@ class ContinuousSurfaceFitter:
     Notes
     -----
     Q-Q regression estimates mu and sigma by fitting a line through the
-    empirical quantiles of Box-Cox transformed window data against the
-    corresponding theoretical normal quantiles using the Blom plotting
+    empirical quantiles of Box-Cox (or Jeo-Yohnson) transformed window data
+    against the corresponding theoretical normal quantiles using the Blom plotting
     position formula ``(i - 3/8) / (n + 1/4)``. The slope gives sigma
     and the intercept gives mu, both in Box-Cox space. Sigma is floored
     at ``1e-6`` to prevent division by zero during Z-score computation.
@@ -119,6 +122,7 @@ class ContinuousSurfaceFitter:
         n_iterations: int = 3,
         log_transform_continuous: bool = False,
         bin_size: int = 120,
+        zero_handles: str = "eps",
     ):
         self.n_bins = n_bins
         self.degree = degree
@@ -134,6 +138,8 @@ class ContinuousSurfaceFitter:
         self._global_mu: float = 0.0
         self._global_sigma: float = 1.0
         self._is_fitted: bool = False
+        self.zero_handles = zero_handles.lower()
+        assert self.zero_handles in ('eps', 'yeojohnson'), "Acceptable values for zero_handles are `eps` or `yeojohnson`."
 
     def fit(self, X_cont: np.ndarray, y: np.ndarray) -> "ContinuousSurfaceFitter":
         """Fit the polynomial mu/sigma curve to rolling window estimates.
@@ -216,7 +222,15 @@ class ContinuousSurfaceFitter:
             X_poly_work = self.poly_transformer.transform(X_work)
             mu_pred = self.mu_model.predict(X_poly_work)
             sigma_pred = np.maximum(self.sigma_model.predict(X_poly_work), 1e-6)
-            y_bc = boxcox(y_work, lmbda=self.lambda_)
+            if np.any(y_work == 0):
+                if self.zero_handles == 'eps':
+                    y_work = y_work + 1e-6
+                    y_bc = boxcox(y_work, lmbda=self.lambda_)
+                else:
+                    y_bc = yeojohnson(y_work, lmbda=self.lambda_)
+            else:
+                y_bc = boxcox(y_work, lmbda=self.lambda_)
+
             z = (y_bc - mu_pred) / sigma_pred
             mask = np.abs(z) <= 3.372
 
