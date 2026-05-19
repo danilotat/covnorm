@@ -386,3 +386,81 @@ def test_surface_fitter_sigma_strictly_positive(rng=RNG):
     fitter.fit(X_cont, y)
     _, sigma = fitter.predict_mu_sigma(X_cont)
     assert np.all(sigma > 0)
+
+
+# ---------------------------------------------------------------------------
+# zero_handles tests
+# ---------------------------------------------------------------------------
+
+
+def _make_data_with_zeros(n: int = 300, rng=None) -> tuple:
+    """Return (X_cont, y) where y contains some exact zeros."""
+    if rng is None:
+        rng = np.random.default_rng(99)
+    X_cont = rng.uniform(20, 80, (n, 1))
+    y = rng.gamma(2.0, 5.0, n)
+    y[rng.choice(n, size=20, replace=False)] = 0.0
+    return X_cont, y
+
+
+def _make_data_with_negatives(n: int = 300, rng=None) -> tuple:
+    """Return (X_cont, y) where y contains zeros and negative values."""
+    if rng is None:
+        rng = np.random.default_rng(77)
+    X_cont = rng.uniform(20, 80, (n, 1))
+    y = rng.normal(loc=5.0, scale=2.0, size=n)
+    return X_cont, y
+
+
+def test_surface_fitter_eps_with_zeros():
+    X_cont, y = _make_data_with_zeros()
+    fitter = ContinuousSurfaceFitter(n_bins=6, degree=2, zero_handles="eps")
+    fitter.fit(X_cont, y)
+    mu, sigma = fitter.predict_mu_sigma(X_cont)
+    assert np.all(np.isfinite(mu))
+    assert np.all(sigma > 0)
+
+
+def test_surface_fitter_yeojohnson_with_zeros():
+    X_cont, y = _make_data_with_zeros()
+    fitter = ContinuousSurfaceFitter(n_bins=6, degree=2, zero_handles="yeojohnson")
+    fitter.fit(X_cont, y)
+    mu, sigma = fitter.predict_mu_sigma(X_cont)
+    assert np.all(np.isfinite(mu))
+    assert np.all(sigma > 0)
+
+
+def test_surface_fitter_yeojohnson_with_negatives():
+    X_cont, y = _make_data_with_negatives()
+    fitter = ContinuousSurfaceFitter(n_bins=6, degree=2, zero_handles="yeojohnson")
+    fitter.fit(X_cont, y)
+    mu, sigma = fitter.predict_mu_sigma(X_cont)
+    assert np.all(np.isfinite(mu))
+    assert np.all(sigma > 0)
+
+
+def test_normalizer_eps_with_zeros_in_target():
+    rng = np.random.default_rng(11)
+    n = 300
+    y = rng.gamma(2.0, 5.0, n)
+    y[rng.choice(n, size=20, replace=False)] = 0.0
+    X = np.column_stack([rng.integers(0, 2, n).astype(float), rng.uniform(20, 80, n), y])
+    norm = RobustConditionalNormalizer(
+        categorical_cols=[0], continuous_cols=[1], target_col=2, zero_handles="eps"
+    )
+    X_norm = norm.fit_transform(X)
+    assert X_norm.shape == X.shape
+    assert np.all(np.isfinite(X_norm[:, 2]))
+
+
+def test_normalizer_yeojohnson_with_negatives_in_target():
+    rng = np.random.default_rng(22)
+    n = 300
+    y = rng.normal(loc=0.0, scale=3.0, size=n)
+    X = np.column_stack([rng.integers(0, 2, n).astype(float), rng.uniform(20, 80, n), y])
+    norm = RobustConditionalNormalizer(
+        categorical_cols=[0], continuous_cols=[1], target_col=2, zero_handles="yeojohnson"
+    )
+    X_norm = norm.fit_transform(X)
+    assert X_norm.shape == X.shape
+    assert np.all(np.isfinite(X_norm[:, 2]))
