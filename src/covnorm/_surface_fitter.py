@@ -222,7 +222,7 @@ class ContinuousSurfaceFitter:
             mu_pred = self.mu_model.predict(X_poly_work)
             sigma_pred = np.maximum(self.sigma_model.predict(X_poly_work), 1e-6)
             if np.any(y_work == 0):
-                if self.zero_handles.lower() == 'eps':
+                if self.zero_handles.lower() == "eps":
                     y_work = y_work + 1e-6
                     y_bc = boxcox(y_work, lmbda=self.lambda_)
                 else:

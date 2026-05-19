@@ -200,7 +200,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         X = self._encode(X, fit=True)
         validate_data(self, X, reset=True)
         self._resolved_target_cols = self._resolve_target_cols(X.shape[1])
-        if self.zero_handles.lower() not in ('eps', 'yeojohnson'):
+        if self.zero_handles.lower() not in ("eps", "yeojohnson"):
             raise ValueError("zero_handles must be 'eps' or 'yeojohnson'.")
 
         X_cont_all = X[:, list(self.continuous_cols)]
@@ -230,10 +230,10 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             fitter.fit(X_cont_all, y_all)
             self._fitters[col] = fitter
             if np.any(y_all == 0):
-                if self.zero_handles.lower() == 'eps':
+                if self.zero_handles.lower() == "eps":
                     y_all = y_all + 1e-6
                     y_bc_all = boxcox(y_all, lmbda=fitter.lambda_)
-                elif self.zero_handles.lower() == 'yeojohnson':
+                elif self.zero_handles.lower() == "yeojohnson":
                     y_bc_all = yeojohnson(y_all, lmbda=fitter.lambda_)
             else:
                 y_bc_all = boxcox(y_all, lmbda=fitter.lambda_)
@@ -305,18 +305,20 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         for col in self._resolved_target_cols:
             y_raw = X_out[:, col]
 
-            if np.any(y_raw < 0) or (self.zero_handles.lower() == 'eps' and np.any(y_raw == 0)):
+            if np.any(y_raw < 0) or (
+                self.zero_handles.lower() == "eps" and np.any(y_raw == 0)
+            ):
                 raise ValueError(
                     f"Column {col} contains non-positive values; Box-Cox requires "
                     "strictly positive data. Use zero_handles='yeojohnson' if zeros are present."
                 )
 
             fitter = self._fitters[col]
-            if np.any(y_raw==0):
-                if self.zero_handles.lower() == 'eps':
+            if np.any(y_raw == 0):
+                if self.zero_handles.lower() == "eps":
                     y_raw = y_raw + 1e-6
                     y_bc = boxcox(y_raw, lmbda=fitter.lambda_)
-                elif self.zero_handles.lower() == 'yeojohnson':
+                elif self.zero_handles.lower() == "yeojohnson":
                     y_bc = yeojohnson(y_raw, lmbda=fitter.lambda_)
             else:
                 y_bc = boxcox(y_raw, lmbda=fitter.lambda_)
