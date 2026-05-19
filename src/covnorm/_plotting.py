@@ -5,6 +5,7 @@ import numpy as np
 from scipy.special import inv_boxcox
 
 if TYPE_CHECKING:
+    import matplotlib.axes
     import matplotlib.figure
 
     from covnorm._normalizer import RobustConditionalNormalizer
@@ -19,14 +20,14 @@ def plot_covariate_space(
     n_sigma: float = 1.0,
     n_grid: int = 300,
     figsize: Optional[Tuple[float, float]] = None,
+    ax: Optional["matplotlib.axes.Axes"] = None,
 ) -> "matplotlib.figure.Figure":
-    """Plot analyte vs continuous covariate(s) with fitted polynomial ribbon.
+    """Plot analyte vs continuous covariate(s) with fitted polynomial surface.
 
-    Produces one subplot per continuous covariate. Each subplot shows a scatter
-    of the raw analyte values and a filled band representing the polynomial
-    fit mu(x) ± n_sigma * sigma(x) back-transformed to the original space.
-    When more than one continuous covariate is present, the remaining
-    covariate(s) are fixed at their sample median for the ribbon calculation.
+    For one continuous covariate, produces a scatter of raw analyte values with
+    a filled ribbon mu(x) ± n_sigma * sigma(x) back-transformed to the original
+    space.  For two continuous covariates, produces a 3-D surface plot of mu(x1,
+    x2) with the per-bin estimates scattered on top.
 
     Parameters
     ----------
@@ -40,14 +41,18 @@ def plot_covariate_space(
         Axis label for each continuous covariate. Length must equal
         ``len(normalizer.continuous_cols)``.
     analyte_label : str, optional
-        Label for the analyte (y-axis). Defaults to ``f"col {target_col}"``.
+        Label for the analyte axis. Defaults to ``f"col {target_col}"``.
     n_sigma : float, default=1.0
-        Half-width of the ribbon in sigma units.
+        Half-width of the ribbon in sigma units (1-D case only).
     n_grid : int, default=300
-        Number of evenly spaced points for the smooth prediction grid.
+        Number of evenly spaced points per axis for the prediction grid.
     figsize : tuple of (float, float), optional
-        Size of a single subplot. The total figure width is
-        ``figsize[0] * n_subplots``. Defaults to ``(6, 5)``.
+        Figure size. Defaults to ``(6, 5)`` for 1-D and ``(8, 6)`` for 2-D.
+        Ignored when ``ax`` is provided.
+    ax : matplotlib.axes.Axes, optional
+        Axes to draw into. For the 2-D case a 3-D axes
+        (``projection='3d'``) must be passed. When ``None`` a new figure
+        and axes are created.
 
     Returns
     -------
@@ -63,7 +68,7 @@ def plot_covariate_space(
     if not normalizer._fitters:
         raise ValueError("Normalizer has not been fitted. Call fit() first.")
 
-    X = np.asarray(X, dtype=float)
+    X = normalizer._encode(X)
 
     if target_col is None:
         target_col = normalizer._resolved_target_cols[0]
@@ -74,79 +79,157 @@ def plot_covariate_space(
     cont_cols = list(normalizer.continuous_cols)
     n_cont = len(cont_cols)
 
-    if figsize is None:
-        figsize = (6, 5)
+    ylabel = analyte_label if analyte_label is not None else f"col {target_col}"
 
-    fig, axes = plt.subplots(
-        1, n_cont, figsize=(figsize[0] * n_cont, figsize[1]), squeeze=False
-    )
-    axes = axes[0]
+    def _xlabel(k: int) -> str:
+        if covariate_labels is not None and k < len(covariate_labels):
+            return covariate_labels[k]
+        return f"covariate col {cont_cols[k]}"
+
+    if n_cont == 2:
+        return _plot_surface_3d(
+            fitter,
+            X,
+            target_col,
+            cont_cols,
+            lambda_,
+            ylabel,
+            _xlabel,
+            n_grid,
+            figsize,
+            ax,
+        )
+
+    if ax is not None:
+        fig = ax.figure
+    else:
+        if figsize is None:
+            figsize = (6, 5)
+        fig, ax = plt.subplots(1, 1, figsize=figsize)
 
     y_raw = X[:, target_col]
+    cont_col = cont_cols[0]
 
-    cont_medians = np.array([np.median(X[:, c]) for c in cont_cols])
+    ax.scatter(X[:, cont_col], y_raw, s=2, alpha=0.4, color="black", linewidths=0)
 
-    for k, cont_col in enumerate(cont_cols):
-        ax = axes[k]
+    x_min, x_max = X[:, cont_col].min(), X[:, cont_col].max()
+    x_grid = np.linspace(x_min, x_max, n_grid).reshape(-1, 1)
 
-        ax.scatter(
-            X[:, cont_col], y_raw, s=5, alpha=0.3, color="steelblue", linewidths=0
-        )
+    mu_grid, sigma_grid = fitter.predict_mu_sigma(x_grid)
+    sigma_grid = np.maximum(sigma_grid, 1e-6)
 
-        x_min, x_max = X[:, cont_col].min(), X[:, cont_col].max()
-        x_grid = np.linspace(x_min, x_max, n_grid)
+    y_center = inv_boxcox(mu_grid, lambda_)
 
-        X_cont_grid = np.tile(cont_medians, (n_grid, 1))
-        X_cont_grid[:, k] = x_grid
+    bc_upper = mu_grid + n_sigma * sigma_grid
+    bc_lower = mu_grid - n_sigma * sigma_grid
+    if lambda_ > 0:
+        bc_lower = np.maximum(bc_lower, -1.0 / lambda_ + 1e-8)
+    elif lambda_ < 0:
+        bc_lower = np.minimum(bc_lower, -1.0 / lambda_ - 1e-8)
 
-        mu_grid, sigma_grid = fitter.predict_mu_sigma(X_cont_grid)
-        sigma_grid = np.maximum(sigma_grid, 1e-6)
+    ax.fill_between(
+        x_grid.ravel(),
+        inv_boxcox(bc_lower, lambda_),
+        inv_boxcox(bc_upper, lambda_),
+        alpha=0.35,
+        color="tomato",
+        label=f"μ ± {n_sigma}σ",
+    )
+    ax.plot(x_grid.ravel(), y_center, lw=2, color="tomato", label="μ(x)")
 
-        y_center = inv_boxcox(mu_grid, lambda_)
+    ax.set_xlabel(_xlabel(0))
+    ax.set_ylabel(ylabel)
+    ax.legend(loc="upper left", fontsize=8)
+    fig.tight_layout()
+    return fig
 
-        bc_upper = mu_grid + n_sigma * sigma_grid
-        bc_lower = mu_grid - n_sigma * sigma_grid
 
-        if lambda_ > 0:
-            bc_lower = np.maximum(bc_lower, -1.0 / lambda_ + 1e-8)
-        elif lambda_ < 0:
-            bc_lower = np.minimum(bc_lower, -1.0 / lambda_ - 1e-8)
+def _plot_surface_3d(
+    fitter,
+    X: np.ndarray,
+    target_col: int,
+    cont_cols: List[int],
+    lambda_: float,
+    zlabel: str,
+    xlabel_fn,
+    n_grid: int,
+    figsize: Optional[Tuple[float, float]],
+    ax=None,
+) -> "matplotlib.figure.Figure":
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-        y_upper = inv_boxcox(bc_upper, lambda_)
-        y_lower = inv_boxcox(bc_lower, lambda_)
+    x0 = np.linspace(X[:, cont_cols[0]].min(), X[:, cont_cols[0]].max(), n_grid)
+    x1 = np.linspace(X[:, cont_cols[1]].min(), X[:, cont_cols[1]].max(), n_grid)
+    X0, X1 = np.meshgrid(x0, x1)
 
-        ax.fill_between(
-            x_grid,
-            y_lower,
-            y_upper,
-            alpha=0.35,
-            color="tomato",
-            label=f"μ ± {n_sigma}σ",
-        )
-        ax.plot(x_grid, y_center, lw=2, color="tomato", label="μ(x)")
+    X_cont_grid = np.column_stack([X0.ravel(), X1.ravel()])
+    mu_flat, _ = fitter.predict_mu_sigma(X_cont_grid)
+    mu_surface = inv_boxcox(mu_flat, lambda_).reshape(X0.shape)
 
-        xlabel = (
-            covariate_labels[k]
-            if covariate_labels is not None and k < len(covariate_labels)
-            else f"covariate col {cont_col}"
-        )
-        ylabel = analyte_label if analyte_label is not None else f"col {target_col}"
+    if ax is not None:
+        fig = ax.figure
+    else:
+        if figsize is None:
+            figsize = (8, 6)
+        fig = plt.figure(figsize=figsize)
+        ax = fig.add_subplot(111, projection="3d")
 
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
-        ax.legend(loc="upper left", fontsize=8)
+    mesh_stride = max(1, n_grid // 40)
+    from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
-        if n_cont > 1:
-            median_val = cont_medians[1 - k]
-            other_label = (
-                covariate_labels[1 - k]
-                if covariate_labels is not None and (1 - k) < len(covariate_labels)
-                else f"col {cont_cols[1 - k]}"
+    norm = plt.Normalize(mu_surface.min(), mu_surface.max())
+    cmap = plt.cm.jet
+
+    ii = list(range(0, n_grid, mesh_stride))
+    jj = list(range(0, n_grid, mesh_stride))
+
+    segments: list = []
+    seg_colors: list = []
+
+    for i in ii:
+        for k in range(len(jj) - 1):
+            j0, j1 = jj[k], jj[k + 1]
+            segments.append(
+                [
+                    (X0[i, j0], X1[i, j0], mu_surface[i, j0]),
+                    (X0[i, j1], X1[i, j1], mu_surface[i, j1]),
+                ]
             )
-            ax.set_title(
-                f"{other_label} fixed at median ({median_val:.2g})", fontsize=9
-            )
+            seg_colors.append(cmap(norm((mu_surface[i, j0] + mu_surface[i, j1]) / 2)))
 
+    for j in jj:
+        for k in range(len(ii) - 1):
+            i0, i1 = ii[k], ii[k + 1]
+            segments.append(
+                [
+                    (X0[i0, j], X1[i0, j], mu_surface[i0, j]),
+                    (X0[i1, j], X1[i1, j], mu_surface[i1, j]),
+                ]
+            )
+            seg_colors.append(cmap(norm((mu_surface[i0, j] + mu_surface[i1, j]) / 2)))
+
+    ax.add_collection3d(Line3DCollection(segments, colors=seg_colors, linewidths=0.6, alpha=.6))
+
+    ax.scatter(
+        X[:, cont_cols[0]],
+        X[:, cont_cols[1]],
+        X[:, target_col],
+        s=3,
+        color="black",
+        alpha=0.3,
+        linewidths=0,
+    )
+
+    ax.set_xlim(X0.min(), X0.max())
+    ax.set_ylim(X1.min(), X1.max())
+    ax.set_zlim(
+        min(mu_surface.min(), X[:, target_col].min()),
+        max(mu_surface.max(), X[:, target_col].max()),
+    )
+
+    ax.set_xlabel(xlabel_fn(0))
+    ax.set_ylabel(xlabel_fn(1))
+    ax.set_zlabel(zlabel)
     fig.tight_layout()
     return fig
 
