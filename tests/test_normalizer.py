@@ -444,7 +444,9 @@ def test_normalizer_eps_with_zeros_in_target():
     n = 300
     y = rng.gamma(2.0, 5.0, n)
     y[rng.choice(n, size=20, replace=False)] = 0.0
-    X = np.column_stack([rng.integers(0, 2, n).astype(float), rng.uniform(20, 80, n), y])
+    X = np.column_stack(
+        [rng.integers(0, 2, n).astype(float), rng.uniform(20, 80, n), y]
+    )
     norm = RobustConditionalNormalizer(
         categorical_cols=[0], continuous_cols=[1], target_col=2, zero_handles="eps"
     )
@@ -457,9 +459,14 @@ def test_normalizer_yeojohnson_with_negatives_in_target():
     rng = np.random.default_rng(22)
     n = 300
     y = rng.normal(loc=0.0, scale=3.0, size=n)
-    X = np.column_stack([rng.integers(0, 2, n).astype(float), rng.uniform(20, 80, n), y])
+    X = np.column_stack(
+        [rng.integers(0, 2, n).astype(float), rng.uniform(20, 80, n), y]
+    )
     norm = RobustConditionalNormalizer(
-        categorical_cols=[0], continuous_cols=[1], target_col=2, zero_handles="yeojohnson"
+        categorical_cols=[0],
+        continuous_cols=[1],
+        target_col=2,
+        zero_handles="yeojohnson",
     )
     X_norm = norm.fit_transform(X)
     assert X_norm.shape == X.shape
