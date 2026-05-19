@@ -2,7 +2,7 @@ import warnings
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
-from scipy.stats import boxcox
+from scipy.stats import boxcox, yeojohnson
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import validate_data
 
@@ -58,6 +58,10 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         before fitting and prediction. Requires strictly positive values.
     bin_size : int, default=120
         Number of samples per rolling window. Mørkved et al. (2015) use 120.
+    zero_handles: str, default=`eps`
+        Strategy to handles zeros in input data. The default behavior is to use
+        Box-Cox transformations, but in case of values equal to 0, the method
+        will use any of the strategy here. Could be one of `eps`, `yeojohnson`
 
     Attributes
     ----------
@@ -69,7 +73,6 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
     _resolved_target_cols : list of int
         The actual column indices to normalise, resolved from ``target_col``
         during :meth:`fit`.
-
     Notes
     -----
     ``X`` passed to :meth:`fit` and :meth:`transform` must be a 2-D array
@@ -111,6 +114,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         n_iterations: int = 3,
         log_transform_continuous: bool = False,
         bin_size: int = 120,
+        zero_handles: str = "eps",
     ):
         self.categorical_cols = categorical_cols
         self.continuous_cols = continuous_cols
@@ -120,6 +124,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         self.n_iterations = n_iterations
         self.log_transform_continuous = log_transform_continuous
         self.bin_size = bin_size
+        self.zero_handles = zero_handles
         self._fitters: Dict[int, ContinuousSurfaceFitter] = {}
         self._cat_corrections: Dict[int, Dict[Tuple, Tuple[float, float]]] = {}
         self._cat_encoders: Dict[int, Dict] = {}
@@ -195,6 +200,8 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         X = self._encode(X, fit=True)
         validate_data(self, X, reset=True)
         self._resolved_target_cols = self._resolve_target_cols(X.shape[1])
+        if self.zero_handles.lower() not in ("eps", "yeojohnson"):
+            raise ValueError("zero_handles must be 'eps' or 'yeojohnson'.")
 
         X_cont_all = X[:, list(self.continuous_cols)]
 
@@ -218,11 +225,19 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
                 n_iterations=self.n_iterations,
                 log_transform_continuous=self.log_transform_continuous,
                 bin_size=self.bin_size,
+                zero_handles=self.zero_handles,
             )
             fitter.fit(X_cont_all, y_all)
             self._fitters[col] = fitter
+            if np.any(y_all == 0):
+                if self.zero_handles.lower() == "eps":
+                    y_all = y_all + 1e-6
+                    y_bc_all = boxcox(y_all, lmbda=fitter.lambda_)
+                elif self.zero_handles.lower() == "yeojohnson":
+                    y_bc_all = yeojohnson(y_all, lmbda=fitter.lambda_)
+            else:
+                y_bc_all = boxcox(y_all, lmbda=fitter.lambda_)
 
-            y_bc_all = boxcox(y_all, lmbda=fitter.lambda_)
             mu_all, sigma_all = fitter.predict_mu_sigma(X_cont_all)
             z_base_all = (y_bc_all - mu_all) / np.maximum(sigma_all, 1e-6)
 
@@ -290,14 +305,24 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         for col in self._resolved_target_cols:
             y_raw = X_out[:, col]
 
-            if np.any(y_raw <= 0):
+            if np.any(y_raw < 0) or (
+                self.zero_handles.lower() == "eps" and np.any(y_raw == 0)
+            ):
                 raise ValueError(
-                    f"Column {col} contains values <= 0; Box-Cox transform requires "
-                    "strictly positive data."
+                    f"Column {col} contains non-positive values; Box-Cox requires "
+                    "strictly positive data. Use zero_handles='yeojohnson' if zeros are present."
                 )
 
             fitter = self._fitters[col]
-            y_bc = boxcox(y_raw, lmbda=fitter.lambda_)
+            if np.any(y_raw == 0):
+                if self.zero_handles.lower() == "eps":
+                    y_raw = y_raw + 1e-6
+                    y_bc = boxcox(y_raw, lmbda=fitter.lambda_)
+                elif self.zero_handles.lower() == "yeojohnson":
+                    y_bc = yeojohnson(y_raw, lmbda=fitter.lambda_)
+            else:
+                y_bc = boxcox(y_raw, lmbda=fitter.lambda_)
+
             mu_pred, sigma_pred = fitter.predict_mu_sigma(X_cont)
             z_base = (y_bc - mu_pred) / np.maximum(sigma_pred, 1e-6)
 
