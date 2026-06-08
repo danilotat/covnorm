@@ -22,36 +22,46 @@ pip install covnorm
 import numpy as np
 from covnorm import RobustConditionalNormalizer
 
-# X columns: [sex, batch, age, marker]
-# sex=0, batch=1 → categorical
-# age=2 → continuous covariate
-# marker=3 → target to normalize
+# Separate covariates from markers before passing to the normalizer.
+data = np.load("data.npy")  # shape (n_samples, 4): [sex, batch, age, marker]
 
-X = np.load("data.npy")  # shape (n_samples, 4)
+sex_batch = data[:, [0, 1]]  # categorical covariates, shape (n_samples, 2)
+age       = data[:, [2]]     # continuous covariate,  shape (n_samples, 1)
+marker    = data[:, [3]]     # marker to normalize,   shape (n_samples, 1)
 
 normalizer = RobustConditionalNormalizer(
-    categorical_cols=[0, 1],
-    continuous_cols=[2],
-    target_col=3,
+    categorical_vals=sex_batch,
+    continuous_vals=age,
     n_bins=6,                      # target number of rolling windows
     bin_size=120,                  # samples per rolling window
     log_transform_continuous=True, # recommended when covariates span orders of magnitude
 )
 
-X_norm = normalizer.fit_transform(X)
+marker_norm = normalizer.fit_transform(marker)
 ```
 
-The target column in `X_norm` contains Z-scores. All other columns are unchanged.
+`marker_norm` has shape `(n_samples, n_markers)` and contains only the Z-scored marker columns — no covariate columns are included in the output.
 
 It follows the scikit-learn `fit` / `transform` / `fit_transform` API and is compatible with `Pipeline`.
+
+### Inference on new samples
+
+`transform()` accepts optional `categorical_vals` and `continuous_vals` overrides so a fitted normalizer can be applied to new samples with different covariate values:
+
+```python
+marker_new_norm = normalizer.transform(
+    marker_new,
+    categorical_vals=sex_batch_new,
+    continuous_vals=age_new,
+)
+```
 
 ## Parameters
 
 | Parameter | Default | Description |
 |---|---|---|
-| `categorical_cols` | — | Column indices treated as categorical grouping variables |
-| `continuous_cols` | — | Column indices used as continuous covariates for surface fitting |
-| `target_col` | — | Column index of the marker to normalize, or `"all"` to normalize every column not listed in `categorical_cols` or `continuous_cols` |
+| `categorical_vals` | — | Array of shape `(n_samples, n_cat)` or `(n_samples,)` with categorical covariate values (e.g. sex, batch). Pass `[]` when there are no categorical covariates. |
+| `continuous_vals` | — | Array of shape `(n_samples, n_cont)` or `(n_samples,)` with continuous covariate values (e.g. age, BMI). Pass `[]` when there are no continuous covariates. |
 | `n_bins` | `6` | Target number of rolling windows (controls stride) |
 | `bin_size` | `120` | Samples per rolling window (Mørkved et al. use 120) |
 | `degree` | `3` | Polynomial degree of the mu/sigma curve |
@@ -66,7 +76,7 @@ from covnorm import plot_covariate_space
 
 fig = plot_covariate_space(
     normalizer,
-    X,
+    data,
     covariate_labels=["age"],
     analyte_label="marker",
 )
