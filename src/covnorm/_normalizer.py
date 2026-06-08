@@ -299,8 +299,12 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         validate_data(self, X, reset=False)
         n_samples = X.shape[0]
 
-        cat_src = categorical_vals if categorical_vals is not None else self.categorical_vals
-        cont_src = continuous_vals if continuous_vals is not None else self.continuous_vals
+        cat_src = (
+            categorical_vals if categorical_vals is not None else self.categorical_vals
+        )
+        cont_src = (
+            continuous_vals if continuous_vals is not None else self.continuous_vals
+        )
 
         cat_raw = self._coerce_covariates(cat_src, n_samples)
         cont_data = self._coerce_covariates(cont_src, n_samples)
@@ -370,20 +374,20 @@ if __name__ == "__main__":
     )
     markers_norm = norm.fit_transform(markers)
 
-    assert markers_norm.shape == markers.shape, (
-        f"Shape mismatch: {markers_norm.shape} != {markers.shape}"
-    )
+    assert (
+        markers_norm.shape == markers.shape
+    ), f"Shape mismatch: {markers_norm.shape} != {markers.shape}"
 
     for group_id in (0, 1):
         mask = data[:, 0] == float(group_id)
         z = markers_norm[mask, 0]
         mean_z = float(np.mean(z))
         std_z = float(np.std(z))
-        assert abs(mean_z) < 0.1, (
-            f"Group {group_id}: mean z = {mean_z:.4f}, expected |mean| < 0.1"
-        )
-        assert abs(std_z - 1.0) < 0.2, (
-            f"Group {group_id}: std z = {std_z:.4f}, expected |std - 1| < 0.2"
-        )
+        assert (
+            abs(mean_z) < 0.1
+        ), f"Group {group_id}: mean z = {mean_z:.4f}, expected |mean| < 0.1"
+        assert (
+            abs(std_z - 1.0) < 0.2
+        ), f"Group {group_id}: std z = {std_z:.4f}, expected |std - 1| < 0.2"
 
     print("PASS")
