@@ -6,6 +6,11 @@ Data layout used throughout: [sex, batch, age, marker]
   col 1 - batch      (categorical, values 0/1/2)
   col 2 - age        (continuous)
   col 3 - marker     (target)
+
+Covariates and markers are passed separately to the new API:
+  categorical_vals = data[:, [0, 1]]
+  continuous_vals  = data[:, [2]]
+  X (fit/transform) = data[:, [3]]
 """
 
 import warnings
@@ -14,7 +19,6 @@ import numpy as np
 import pytest
 from sklearn.base import clone
 from sklearn.pipeline import Pipeline
-from sklearn.utils.estimator_checks import parametrize_with_checks
 
 from covnorm import ContinuousSurfaceFitter, RobustConditionalNormalizer
 
@@ -61,11 +65,10 @@ def data() -> np.ndarray:
 @pytest.fixture(scope="module")
 def normalizer_full(data) -> RobustConditionalNormalizer:
     norm = RobustConditionalNormalizer(
-        categorical_cols=[0, 1],
-        continuous_cols=[2],
-        target_col=3,
+        categorical_vals=data[:, [0, 1]],
+        continuous_vals=data[:, [2]],
     )
-    norm.fit(data)
+    norm.fit(data[:, [3]])
     return norm
 
 
@@ -75,21 +78,25 @@ def normalizer_full(data) -> RobustConditionalNormalizer:
 
 
 def test_get_params():
+    rng = np.random.default_rng(0)
+    cat = rng.integers(0, 2, (10, 1)).astype(float)
+    cont = rng.uniform(0, 1, (10, 1))
     norm = RobustConditionalNormalizer(
-        categorical_cols=[0], continuous_cols=[1], target_col=2, n_bins=8, degree=3
+        categorical_vals=cat, continuous_vals=cont, n_bins=8, degree=3
     )
     params = norm.get_params()
-    assert params["categorical_cols"] == [0]
-    assert params["continuous_cols"] == [1]
-    assert params["target_col"] == 2
+    assert "categorical_vals" in params
+    assert "continuous_vals" in params
+    assert "target_col" not in params
     assert params["n_bins"] == 8
     assert params["degree"] == 3
 
 
 def test_set_params():
-    norm = RobustConditionalNormalizer(
-        categorical_cols=[0], continuous_cols=[1], target_col=2
-    )
+    rng = np.random.default_rng(0)
+    cat = rng.integers(0, 2, (10, 1)).astype(float)
+    cont = rng.uniform(0, 1, (10, 1))
+    norm = RobustConditionalNormalizer(categorical_vals=cat, continuous_vals=cont)
     norm.set_params(n_bins=10, degree=1)
     assert norm.n_bins == 10
     assert norm.degree == 1
@@ -98,9 +105,8 @@ def test_set_params():
 def test_clone_produces_unfitted_copy(normalizer_full, data):
     cloned = clone(normalizer_full)
     assert cloned._cat_corrections == {}
-    # cloned estimator must be independently fittable
-    X_norm = cloned.fit_transform(data)
-    assert X_norm.shape == data.shape
+    X_norm = cloned.fit_transform(data[:, [3]])
+    assert X_norm.shape == data[:, [3]].shape
 
 
 def test_pipeline_compatible(data):
@@ -109,13 +115,14 @@ def test_pipeline_compatible(data):
             (
                 "norm",
                 RobustConditionalNormalizer(
-                    categorical_cols=[0, 1], continuous_cols=[2], target_col=3
+                    categorical_vals=data[:, [0, 1]],
+                    continuous_vals=data[:, [2]],
                 ),
             )
         ]
     )
-    X_norm = pipe.fit_transform(data)
-    assert X_norm.shape == data.shape
+    X_norm = pipe.fit_transform(data[:, [3]])
+    assert X_norm.shape == data[:, [3]].shape
 
 
 # ---------------------------------------------------------------------------
@@ -124,35 +131,71 @@ def test_pipeline_compatible(data):
 
 
 def test_output_shape(normalizer_full, data):
-    X_norm = normalizer_full.transform(data)
-    assert X_norm.shape == data.shape
+    X_markers = data[:, [3]]
+    X_norm = normalizer_full.transform(X_markers)
+    assert X_norm.shape == X_markers.shape
 
 
-def test_nontarget_columns_unchanged(normalizer_full, data):
-    X_norm = normalizer_full.transform(data)
-    for col in [0, 1, 2]:
-        np.testing.assert_array_equal(X_norm[:, col], data[:, col])
+def test_transform_returns_only_target_columns(normalizer_full, data):
+    """Key contract: output has marker shape, not full matrix shape."""
+    X_markers = data[:, [3]]
+    X_norm = normalizer_full.transform(X_markers)
+    assert X_norm.shape == X_markers.shape  # (n, 1), not (n, 4)
+    assert X_norm.shape[1] == 1
 
 
 def test_input_array_not_mutated(data):
-    X_copy = data.copy()
+    X_markers = data[:, [3]].copy()
+    X_copy = X_markers.copy()
     norm = RobustConditionalNormalizer(
-        categorical_cols=[0, 1], continuous_cols=[2], target_col=3
+        categorical_vals=data[:, [0, 1]],
+        continuous_vals=data[:, [2]],
     )
-    norm.fit_transform(X_copy)
-    np.testing.assert_array_equal(X_copy, data)
+    norm.fit_transform(X_markers)
+    np.testing.assert_array_equal(X_markers, X_copy)
 
 
 def test_fit_transform_equals_fit_then_transform(data):
+    X_markers = data[:, [3]]
     norm_a = RobustConditionalNormalizer(
-        categorical_cols=[0, 1], continuous_cols=[2], target_col=3
+        categorical_vals=data[:, [0, 1]],
+        continuous_vals=data[:, [2]],
     )
     norm_b = RobustConditionalNormalizer(
-        categorical_cols=[0, 1], continuous_cols=[2], target_col=3
+        categorical_vals=data[:, [0, 1]],
+        continuous_vals=data[:, [2]],
     )
-    X_a = norm_a.fit_transform(data)
-    X_b = norm_b.fit(data).transform(data)
+    X_a = norm_a.fit_transform(X_markers)
+    X_b = norm_b.fit(X_markers).transform(X_markers)
     np.testing.assert_array_almost_equal(X_a, X_b)
+
+
+def test_multiple_markers_normalized(data):
+    """transform handles multiple marker columns simultaneously."""
+    rng = np.random.default_rng(55)
+    n = 300
+    markers = rng.gamma(2, 5, (n, 3))
+    cat = data[:n, [0, 1]]
+    cont = data[:n, [2]]
+    norm = RobustConditionalNormalizer(categorical_vals=cat, continuous_vals=cont)
+    out = norm.fit_transform(markers)
+    assert out.shape == markers.shape
+
+
+def test_transform_with_override_covariates(data):
+    """Passing different covariates to transform uses them instead of stored ones."""
+    n = data.shape[0]
+    norm = RobustConditionalNormalizer(
+        categorical_vals=data[:, [0]],
+        continuous_vals=data[:, [2]],
+    )
+    norm.fit(data[:, [3]])
+    X_norm = norm.transform(
+        data[:, [3]],
+        categorical_vals=np.zeros((n, 1)),
+        continuous_vals=data[:, [2]],
+    )
+    assert X_norm.shape == (n, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -162,13 +205,14 @@ def test_fit_transform_equals_fit_then_transform(data):
 
 def test_zscore_mean_near_zero_per_group(data):
     norm = RobustConditionalNormalizer(
-        categorical_cols=[0], continuous_cols=[], target_col=3
+        categorical_vals=data[:, [0]],
+        continuous_vals=np.empty((data.shape[0], 0)),
     )
-    X_norm = norm.fit_transform(data)
+    X_norm = norm.fit_transform(data[:, [3]])
 
     for sex_val in [0, 1]:
         mask = data[:, 0] == sex_val
-        group_z = X_norm[mask, 3]
+        group_z = X_norm[mask, 0]
         assert (
             abs(np.mean(group_z)) < 0.3
         ), f"Mean Z-score for sex={sex_val} is {np.mean(group_z):.3f}, expected near 0"
@@ -176,13 +220,14 @@ def test_zscore_mean_near_zero_per_group(data):
 
 def test_zscore_std_near_one_per_group(data):
     norm = RobustConditionalNormalizer(
-        categorical_cols=[0], continuous_cols=[], target_col=3
+        categorical_vals=data[:, [0]],
+        continuous_vals=np.empty((data.shape[0], 0)),
     )
-    X_norm = norm.fit_transform(data)
+    X_norm = norm.fit_transform(data[:, [3]])
 
     for sex_val in [0, 1]:
         mask = data[:, 0] == sex_val
-        group_z = X_norm[mask, 3]
+        group_z = X_norm[mask, 0]
         assert (
             0.7 < np.std(group_z) < 1.3
         ), f"Std Z-score for sex={sex_val} is {np.std(group_z):.3f}, expected near 1"
@@ -192,12 +237,13 @@ def test_groups_are_normalized_independently(data):
     """After normalization, both groups should have similar scale regardless of
     their original mu/sigma offset."""
     norm = RobustConditionalNormalizer(
-        categorical_cols=[0], continuous_cols=[], target_col=3
+        categorical_vals=data[:, [0]],
+        continuous_vals=np.empty((data.shape[0], 0)),
     )
-    X_norm = norm.fit_transform(data)
+    X_norm = norm.fit_transform(data[:, [3]])
 
-    means = [np.mean(X_norm[data[:, 0] == v, 3]) for v in [0, 1]]
-    stds = [np.std(X_norm[data[:, 0] == v, 3]) for v in [0, 1]]
+    means = [np.mean(X_norm[data[:, 0] == v, 0]) for v in [0, 1]]
+    stds = [np.std(X_norm[data[:, 0] == v, 0]) for v in [0, 1]]
 
     # groups had different gamma scales originally — after normalization both near 0
     assert abs(means[0] - means[1]) < 0.5
@@ -210,38 +256,45 @@ def test_groups_are_normalized_independently(data):
 
 
 def test_no_categorical_covariates(data):
+    n = data.shape[0]
     norm = RobustConditionalNormalizer(
-        categorical_cols=[], continuous_cols=[2], target_col=3
+        categorical_vals=np.empty((n, 0)),
+        continuous_vals=data[:, [2]],
     )
-    X_norm = norm.fit_transform(data)
-    assert X_norm.shape == data.shape
+    X_norm = norm.fit_transform(data[:, [3]])
+    assert X_norm.shape == data[:, [3]].shape
     assert len(norm._cat_corrections) == 1  # single global group
 
 
 def test_no_continuous_covariates(data):
+    n = data.shape[0]
     norm = RobustConditionalNormalizer(
-        categorical_cols=[0], continuous_cols=[], target_col=3
+        categorical_vals=data[:, [0]],
+        continuous_vals=np.empty((n, 0)),
     )
-    X_norm = norm.fit_transform(data)
-    assert X_norm.shape == data.shape
+    X_norm = norm.fit_transform(data[:, [3]])
+    assert X_norm.shape == data[:, [3]].shape
 
 
 def test_no_covariates_global_normalization(data):
+    n = data.shape[0]
     norm = RobustConditionalNormalizer(
-        categorical_cols=[], continuous_cols=[], target_col=3
+        categorical_vals=np.empty((n, 0)),
+        continuous_vals=np.empty((n, 0)),
     )
-    X_norm = norm.fit_transform(data)
-    assert X_norm.shape == data.shape
+    X_norm = norm.fit_transform(data[:, [3]])
+    assert X_norm.shape == data[:, [3]].shape
     assert len(norm._cat_corrections) == 1
 
 
 def test_two_categorical_covariates(data):
     norm = RobustConditionalNormalizer(
-        categorical_cols=[0, 1], continuous_cols=[], target_col=3
+        categorical_vals=data[:, [0, 1]],
+        continuous_vals=np.empty((data.shape[0], 0)),
     )
-    X_norm = norm.fit_transform(data)
-    assert X_norm.shape == data.shape
-    assert len(norm._cat_corrections[3]) == 2  # (sex=0,batch=0) and (sex=1,batch=1)
+    X_norm = norm.fit_transform(data[:, [3]])
+    assert X_norm.shape == data[:, [3]].shape
+    assert len(norm._cat_corrections[0]) == 2  # (sex=0,batch=0) and (sex=1,batch=1)
 
 
 # ---------------------------------------------------------------------------
@@ -251,53 +304,52 @@ def test_two_categorical_covariates(data):
 
 def test_unseen_category_at_transform_warns_and_zeroes(data):
     norm = RobustConditionalNormalizer(
-        categorical_cols=[0], continuous_cols=[], target_col=3
+        categorical_vals=data[:, [0]],
+        continuous_vals=np.empty((data.shape[0], 0)),
     )
-    norm.fit(data)
+    norm.fit(data[:, [3]])
 
-    # Introduce an unseen sex value (sex=99)
-    X_unseen = data[:5].copy()
-    X_unseen[:, 0] = 99
-
+    unseen_cat = np.full((5, 1), 99.0)
     with pytest.warns(UserWarning, match="Unseen categorical combination"):
-        X_norm = norm.transform(X_unseen)
+        X_norm = norm.transform(
+            data[:5, [3]],
+            categorical_vals=unseen_cat,
+            continuous_vals=np.empty((5, 0)),
+        )
 
-    np.testing.assert_array_equal(X_norm[:, 3], 0.0)
+    np.testing.assert_array_equal(X_norm[:, 0], 0.0)
 
 
 def test_constant_target_does_not_raise():
     """sigma floor at 1e-6 must prevent division by zero for near-constant data."""
     rng = np.random.default_rng(0)
-    X = np.zeros((50, 3))
-    X[:, 0] = np.arange(50)  # continuous covariate
-    X[:, 1] = 1.0 + rng.gamma(0.001, 0.001, 50)  # near-constant positive target
+    n = 50
+    cont = np.arange(n).reshape(-1, 1).astype(float)
+    target = 1.0 + rng.gamma(0.001, 0.001, (n, 1))
     norm = RobustConditionalNormalizer(
-        categorical_cols=[], continuous_cols=[0], target_col=1
+        categorical_vals=np.empty((n, 0)),
+        continuous_vals=cont,
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        X_norm = norm.fit_transform(X)
-    assert np.all(np.isfinite(X_norm[:, 1]))
+        X_norm = norm.fit_transform(target)
+    assert np.all(np.isfinite(X_norm[:, 0]))
 
 
 def test_single_sample_per_group_falls_back(rng=RNG):
     """Groups with fewer than MIN_BIN_SAMPLES should fall back gracefully."""
     n = 5
-    X = np.column_stack(
-        [
-            np.zeros(n),  # categorical col (single group)
-            rng.uniform(0, 1, n),  # continuous col
-            rng.gamma(2, 1, n),  # target: strictly positive for Box-Cox
-        ]
-    )
+    cat = np.zeros((n, 1))
+    cont = rng.uniform(0, 1, (n, 1))
+    target = rng.gamma(2, 1, (n, 1))
     norm = RobustConditionalNormalizer(
-        categorical_cols=[0], continuous_cols=[1], target_col=2, n_bins=6
+        categorical_vals=cat, continuous_vals=cont, n_bins=6
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        X_norm = norm.fit_transform(X)
-    assert X_norm.shape == X.shape
-    assert np.all(np.isfinite(X_norm[:, 2]))
+        X_norm = norm.fit_transform(target)
+    assert X_norm.shape == target.shape
+    assert np.all(np.isfinite(X_norm[:, 0]))
 
 
 # ---------------------------------------------------------------------------
@@ -306,52 +358,37 @@ def test_single_sample_per_group_falls_back(rng=RNG):
 
 
 def test_too_many_categorical_raises():
+    rng = np.random.default_rng(0)
     with pytest.raises(ValueError, match="Exceeded max categorical"):
         RobustConditionalNormalizer(
-            categorical_cols=[0, 1, 2], continuous_cols=[], target_col=3
+            categorical_vals=rng.integers(0, 2, (10, 3)).astype(float),
+            continuous_vals=np.empty((10, 0)),
         )
 
 
 def test_too_many_continuous_raises():
+    rng = np.random.default_rng(0)
     with pytest.raises(ValueError, match="Exceeded max continuous"):
         RobustConditionalNormalizer(
-            categorical_cols=[], continuous_cols=[0, 1, 2], target_col=3
+            categorical_vals=np.empty((10, 0)),
+            continuous_vals=rng.uniform(0, 1, (10, 3)),
         )
 
 
 def test_two_continuous_covariates():
     rng = np.random.default_rng(7)
     n = 600
-    X = np.column_stack(
-        [
-            rng.integers(0, 2, n).astype(float),
-            rng.uniform(20, 80, n),
-            rng.uniform(1, 50, n),
-            rng.gamma(4.0, 2.0, n),
-        ]
-    )
+    cat = rng.integers(0, 2, (n, 1)).astype(float)
+    cont = np.column_stack([rng.uniform(20, 80, n), rng.uniform(1, 50, n)])
+    markers = rng.gamma(4.0, 2.0, (n, 1))
     norm = RobustConditionalNormalizer(
-        categorical_cols=[0], continuous_cols=[1, 2], target_col=3, n_bins=10
+        categorical_vals=cat, continuous_vals=cont, n_bins=10
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        X_norm = norm.fit_transform(X)
-    assert X_norm.shape == X.shape
-    assert np.all(np.isfinite(X_norm[:, 3]))
-
-
-def test_target_col_in_categorical_raises():
-    with pytest.raises(ValueError, match="Target column cannot be included"):
-        RobustConditionalNormalizer(
-            categorical_cols=[0], continuous_cols=[1], target_col=0
-        )
-
-
-def test_target_col_in_continuous_raises():
-    with pytest.raises(ValueError, match="Target column cannot be included"):
-        RobustConditionalNormalizer(
-            categorical_cols=[0], continuous_cols=[1], target_col=1
-        )
+        X_norm = norm.fit_transform(markers)
+    assert X_norm.shape == markers.shape
+    assert np.all(np.isfinite(X_norm[:, 0]))
 
 
 # ---------------------------------------------------------------------------
@@ -442,32 +479,29 @@ def test_surface_fitter_yeojohnson_with_negatives():
 def test_normalizer_eps_with_zeros_in_target():
     rng = np.random.default_rng(11)
     n = 300
-    y = rng.gamma(2.0, 5.0, n)
+    cat = rng.integers(0, 2, (n, 1)).astype(float)
+    cont = rng.uniform(20, 80, (n, 1))
+    y = rng.gamma(2.0, 5.0, (n, 1))
     y[rng.choice(n, size=20, replace=False)] = 0.0
-    X = np.column_stack(
-        [rng.integers(0, 2, n).astype(float), rng.uniform(20, 80, n), y]
-    )
     norm = RobustConditionalNormalizer(
-        categorical_cols=[0], continuous_cols=[1], target_col=2, zero_handles="eps"
+        categorical_vals=cat, continuous_vals=cont, zero_handles="eps"
     )
-    X_norm = norm.fit_transform(X)
-    assert X_norm.shape == X.shape
-    assert np.all(np.isfinite(X_norm[:, 2]))
+    X_norm = norm.fit_transform(y)
+    assert X_norm.shape == y.shape
+    assert np.all(np.isfinite(X_norm[:, 0]))
 
 
 def test_normalizer_yeojohnson_with_negatives_in_target():
     rng = np.random.default_rng(22)
     n = 300
-    y = rng.normal(loc=0.0, scale=3.0, size=n)
-    X = np.column_stack(
-        [rng.integers(0, 2, n).astype(float), rng.uniform(20, 80, n), y]
-    )
+    cat = rng.integers(0, 2, (n, 1)).astype(float)
+    cont = rng.uniform(20, 80, (n, 1))
+    y = rng.normal(loc=0.0, scale=3.0, size=(n, 1))
     norm = RobustConditionalNormalizer(
-        categorical_cols=[0],
-        continuous_cols=[1],
-        target_col=2,
+        categorical_vals=cat,
+        continuous_vals=cont,
         zero_handles="yeojohnson",
     )
-    X_norm = norm.fit_transform(X)
-    assert X_norm.shape == X.shape
-    assert np.all(np.isfinite(X_norm[:, 2]))
+    X_norm = norm.fit_transform(y)
+    assert X_norm.shape == y.shape
+    assert np.all(np.isfinite(X_norm[:, 0]))
