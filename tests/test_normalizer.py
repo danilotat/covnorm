@@ -302,6 +302,19 @@ def test_two_categorical_covariates(data):
 # ---------------------------------------------------------------------------
 
 
+def test_string_categorical_values(data):
+    """String labels ('M'/'F') must be encoded without raising ValueError."""
+    rng = np.random.default_rng(99)
+    n = data.shape[0]
+    cat_str = np.where(rng.integers(0, 2, (n, 1)) == 0, "M", "F")
+    cont = data[:, [2]]
+    marker = data[:, [3]]
+    norm = RobustConditionalNormalizer(categorical_vals=cat_str, continuous_vals=cont)
+    X_norm = norm.fit_transform(marker)
+    assert X_norm.shape == marker.shape
+    assert np.all(np.isfinite(X_norm[:, 0]))
+
+
 def test_unseen_category_at_transform_warns_and_zeroes(data):
     norm = RobustConditionalNormalizer(
         categorical_vals=data[:, [0]],

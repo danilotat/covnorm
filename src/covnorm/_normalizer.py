@@ -138,7 +138,8 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         arr = np.asarray(vals)
         if arr.size == 0:
             return np.empty((n_samples, 0), dtype=float)
-        arr = arr.astype(float)
+        if arr.dtype.kind not in "USO":
+            arr = arr.astype(float)
         if arr.ndim == 1:
             arr = arr.reshape(-1, 1)
         return arr
