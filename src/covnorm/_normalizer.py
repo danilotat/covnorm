@@ -78,6 +78,13 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
     Unseen categorical combinations at transform time produce a warning and
     are assigned a Z-score of 0.
 
+    When calling :meth:`transform` on data that has fewer rows than the
+    training set (e.g. a single new sample), you **must** supply matching
+    ``categorical_vals`` and ``continuous_vals`` overrides whose row count
+    equals ``X.shape[0]``.  Omitting them causes the stored training-time
+    covariate arrays to be used, whose row indices exceed the size of the
+    new ``X`` and result in an ``IndexError``.
+
     Examples
     --------
     >>> import numpy as np
@@ -276,11 +283,17 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             Box-Cox) unless ``zero_handles='yeojohnson'`` is set.
         categorical_vals : ArrayLike, optional
             Override the categorical covariate values stored at construction.
-            Must have the same number of columns as the training
-            ``categorical_vals``. Useful for applying a fitted normalizer to
-            new samples with different categorical covariate values.
+            Must have the same number of rows as ``X`` and the same number of
+            columns as the training ``categorical_vals``. **Required when**
+            ``X`` contains fewer samples than the training set (e.g. a single
+            new sample), because the covariate arrays stored at construction
+            time have the training size; using them would misalign row indices
+            and raise an ``IndexError``.
         continuous_vals : ArrayLike, optional
             Override the continuous covariate values stored at construction.
+            Must have the same number of rows as ``X``. Same requirement as
+            ``categorical_vals`` applies when ``X`` has fewer rows than the
+            training set.
 
         Returns
         -------
