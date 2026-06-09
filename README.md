@@ -56,6 +56,8 @@ marker_new_norm = normalizer.transform(
 )
 ```
 
+> **Important:** when `marker_new` contains fewer rows than the training set (including the common case of a single sample), you **must** pass `categorical_vals` and `continuous_vals` whose row count matches `marker_new.shape[0]`. If the overrides are omitted, `transform()` falls back to the training-time covariate arrays, which have a different number of rows, causing an `IndexError`.
+
 ## Parameters
 
 | Parameter | Default | Description |
