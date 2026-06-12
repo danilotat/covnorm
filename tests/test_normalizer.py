@@ -222,6 +222,7 @@ def test_zscore_std_near_one_per_group(data):
     norm = RobustConditionalNormalizer(
         categorical_vals=data[:, [0]],
         continuous_vals=np.empty((data.shape[0], 0)),
+        anova_alpha=1.0,
     )
     X_norm = norm.fit_transform(data[:, [3]])
 
@@ -518,3 +519,125 @@ def test_normalizer_yeojohnson_with_negatives_in_target():
     X_norm = norm.fit_transform(y)
     assert X_norm.shape == y.shape
     assert np.all(np.isfinite(X_norm[:, 0]))
+
+
+class TestAnovaGating:
+    """Significance gates for categorical mean and scale corrections."""
+
+    def test_no_correction_when_groups_identical(self):
+        """Same distribution in both groups → f_oneway and levene non-significant → identity."""
+        rng = np.random.default_rng(42)
+        n = 600
+        cat = np.repeat([0.0, 1.0], n // 2).reshape(-1, 1)
+        cont = rng.uniform(1, 80, (n, 1))
+        marker = rng.gamma(2, 10, (n, 1))
+
+        norm = RobustConditionalNormalizer(
+            categorical_vals=cat,
+            continuous_vals=cont,
+            anova_alpha=0.05,
+        )
+        norm.fit(marker)
+
+        assert hasattr(norm, "_anova_pvalues_")
+        assert hasattr(norm, "_levene_pvalues_")
+        assert norm._anova_pvalues_[0] > 0.05, f"Expected non-significant ANOVA, got p={norm._anova_pvalues_[0]}"
+        assert norm._levene_pvalues_[0] > 0.05, f"Expected non-significant Levene, got p={norm._levene_pvalues_[0]}"
+
+        for tup, (mu, sigma) in norm._cat_corrections[0].items():
+            assert mu == 0.0, f"Expected mu=0.0 for group {tup}, got {mu}"
+            assert sigma == 1.0, f"Expected sigma=1.0 for group {tup}, got {sigma}"
+
+    def test_location_and_scale_corrections_applied_when_groups_differ(self):
+        """Groups with very different scales trigger both f_oneway and levene → mu and sigma corrected."""
+        rng = np.random.default_rng(8)
+        n = 600
+        cat = np.repeat([0.0, 1.0], n // 2).reshape(-1, 1)
+        cont = rng.uniform(1, 80, (n, 1))
+        # Large scale ratio creates clear mean and variance differences in z_base
+        marker = np.concatenate([
+            rng.gamma(2, 5, (n // 2, 1)),
+            rng.gamma(2, 30, (n // 2, 1)),
+        ])
+
+        norm = RobustConditionalNormalizer(
+            categorical_vals=cat,
+            continuous_vals=cont,
+            anova_alpha=0.05,
+        )
+        norm.fit(marker)
+
+        assert norm._anova_pvalues_[0] <= 0.05, f"Expected significant f_oneway, got p={norm._anova_pvalues_[0]}"
+        assert norm._levene_pvalues_[0] <= 0.05, f"Expected significant Levene, got p={norm._levene_pvalues_[0]}"
+
+        # At least one group must have a non-identity correction on mu or sigma
+        corrections = norm._cat_corrections[0]
+        any_nonidentity = any(mu != 0.0 or sigma != 1.0 for mu, sigma in corrections.values())
+        assert any_nonidentity, "Expected at least one non-identity correction"
+
+    def test_anova_alpha_zero_always_skips_both_corrections(self):
+        """anova_alpha=0.0 means apply_correction is never True → identity for mu and sigma."""
+        rng = np.random.default_rng(9)
+        n = 400
+        cat = np.repeat([0.0, 1.0], n // 2).reshape(-1, 1)
+        cont = rng.uniform(1, 80, (n, 1))
+        # Use strongly different groups so that without the guard, corrections would apply
+        marker = np.concatenate([
+            rng.gamma(2, 5, (n // 2, 1)),
+            rng.gamma(2, 30, (n // 2, 1)),
+        ])
+
+        norm = RobustConditionalNormalizer(
+            categorical_vals=cat,
+            continuous_vals=cont,
+            anova_alpha=0.0,
+        )
+        norm.fit(marker)
+
+        # anova_alpha=0.0 uses (alpha > 0.0) and (...) guard → always identity
+        for tup, (mu, sigma) in norm._cat_corrections[0].items():
+            assert mu == 0.0, f"anova_alpha=0 should skip mu correction, got mu={mu}"
+            assert sigma == 1.0, f"anova_alpha=0 should skip sigma correction, got sigma={sigma}"
+
+    def test_degenerate_singleton_group_stored_as_nan(self):
+        """A singleton group causes the tests to be skipped; p-values stored as np.nan."""
+        rng = np.random.default_rng(11)
+        n = 100
+        # One group has only 1 sample; f_oneway/levene require >= 2 per group
+        cat_vals = np.array([0.0] + [1.0] * (n - 1)).reshape(-1, 1)
+        cont = rng.uniform(1, 80, (n, 1))
+        marker = rng.gamma(2, 10, (n, 1))
+
+        norm = RobustConditionalNormalizer(
+            categorical_vals=cat_vals,
+            continuous_vals=cont,
+            anova_alpha=0.05,
+        )
+        norm.fit(marker)
+
+        import math
+        assert math.isnan(norm._anova_pvalues_[0]), "Expected np.nan for degenerate groups"
+        assert math.isnan(norm._levene_pvalues_[0]), "Expected np.nan for degenerate groups"
+        # All corrections must be identity since tests were skipped
+        for tup, (mu, sigma) in norm._cat_corrections[0].items():
+            assert mu == 0.0
+            assert sigma == 1.0
+
+    def test_anova_alpha_out_of_range_raises(self):
+        """anova_alpha outside [0, 1] must raise ValueError at construction."""
+        import pytest
+        rng = np.random.default_rng(12)
+        cat = rng.integers(0, 2, 100).astype(float).reshape(-1, 1)
+        cont = rng.uniform(1, 80, (100, 1))
+        with pytest.raises(ValueError, match="anova_alpha"):
+            RobustConditionalNormalizer(
+                categorical_vals=cat,
+                continuous_vals=cont,
+                anova_alpha=1.5,
+            )
+        with pytest.raises(ValueError, match="anova_alpha"):
+            RobustConditionalNormalizer(
+                categorical_vals=cat,
+                continuous_vals=cont,
+                anova_alpha=-0.1,
+            )
