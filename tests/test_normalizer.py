@@ -541,8 +541,12 @@ class TestAnovaGating:
 
         assert hasattr(norm, "_anova_pvalues_")
         assert hasattr(norm, "_levene_pvalues_")
-        assert norm._anova_pvalues_[0] > 0.05, f"Expected non-significant ANOVA, got p={norm._anova_pvalues_[0]}"
-        assert norm._levene_pvalues_[0] > 0.05, f"Expected non-significant Levene, got p={norm._levene_pvalues_[0]}"
+        assert (
+            norm._anova_pvalues_[0] > 0.05
+        ), f"Expected non-significant ANOVA, got p={norm._anova_pvalues_[0]}"
+        assert (
+            norm._levene_pvalues_[0] > 0.05
+        ), f"Expected non-significant Levene, got p={norm._levene_pvalues_[0]}"
 
         for tup, (mu, sigma) in norm._cat_corrections[0].items():
             assert mu == 0.0, f"Expected mu=0.0 for group {tup}, got {mu}"
@@ -555,10 +559,12 @@ class TestAnovaGating:
         cat = np.repeat([0.0, 1.0], n // 2).reshape(-1, 1)
         cont = rng.uniform(1, 80, (n, 1))
         # Large scale ratio creates clear mean and variance differences in z_base
-        marker = np.concatenate([
-            rng.gamma(2, 5, (n // 2, 1)),
-            rng.gamma(2, 30, (n // 2, 1)),
-        ])
+        marker = np.concatenate(
+            [
+                rng.gamma(2, 5, (n // 2, 1)),
+                rng.gamma(2, 30, (n // 2, 1)),
+            ]
+        )
 
         norm = RobustConditionalNormalizer(
             categorical_vals=cat,
@@ -567,12 +573,18 @@ class TestAnovaGating:
         )
         norm.fit(marker)
 
-        assert norm._anova_pvalues_[0] <= 0.05, f"Expected significant f_oneway, got p={norm._anova_pvalues_[0]}"
-        assert norm._levene_pvalues_[0] <= 0.05, f"Expected significant Levene, got p={norm._levene_pvalues_[0]}"
+        assert (
+            norm._anova_pvalues_[0] <= 0.05
+        ), f"Expected significant f_oneway, got p={norm._anova_pvalues_[0]}"
+        assert (
+            norm._levene_pvalues_[0] <= 0.05
+        ), f"Expected significant Levene, got p={norm._levene_pvalues_[0]}"
 
         # At least one group must have a non-identity correction on mu or sigma
         corrections = norm._cat_corrections[0]
-        any_nonidentity = any(mu != 0.0 or sigma != 1.0 for mu, sigma in corrections.values())
+        any_nonidentity = any(
+            mu != 0.0 or sigma != 1.0 for mu, sigma in corrections.values()
+        )
         assert any_nonidentity, "Expected at least one non-identity correction"
 
     def test_anova_alpha_zero_always_skips_both_corrections(self):
@@ -582,10 +594,12 @@ class TestAnovaGating:
         cat = np.repeat([0.0, 1.0], n // 2).reshape(-1, 1)
         cont = rng.uniform(1, 80, (n, 1))
         # Use strongly different groups so that without the guard, corrections would apply
-        marker = np.concatenate([
-            rng.gamma(2, 5, (n // 2, 1)),
-            rng.gamma(2, 30, (n // 2, 1)),
-        ])
+        marker = np.concatenate(
+            [
+                rng.gamma(2, 5, (n // 2, 1)),
+                rng.gamma(2, 30, (n // 2, 1)),
+            ]
+        )
 
         norm = RobustConditionalNormalizer(
             categorical_vals=cat,
@@ -597,7 +611,9 @@ class TestAnovaGating:
         # anova_alpha=0.0 uses (alpha > 0.0) and (...) guard → always identity
         for tup, (mu, sigma) in norm._cat_corrections[0].items():
             assert mu == 0.0, f"anova_alpha=0 should skip mu correction, got mu={mu}"
-            assert sigma == 1.0, f"anova_alpha=0 should skip sigma correction, got sigma={sigma}"
+            assert (
+                sigma == 1.0
+            ), f"anova_alpha=0 should skip sigma correction, got sigma={sigma}"
 
     def test_degenerate_singleton_group_stored_as_nan(self):
         """A singleton group causes the tests to be skipped; p-values stored as np.nan."""
@@ -616,8 +632,13 @@ class TestAnovaGating:
         norm.fit(marker)
 
         import math
-        assert math.isnan(norm._anova_pvalues_[0]), "Expected np.nan for degenerate groups"
-        assert math.isnan(norm._levene_pvalues_[0]), "Expected np.nan for degenerate groups"
+
+        assert math.isnan(
+            norm._anova_pvalues_[0]
+        ), "Expected np.nan for degenerate groups"
+        assert math.isnan(
+            norm._levene_pvalues_[0]
+        ), "Expected np.nan for degenerate groups"
         # All corrections must be identity since tests were skipped
         for tup, (mu, sigma) in norm._cat_corrections[0].items():
             assert mu == 0.0
@@ -626,6 +647,7 @@ class TestAnovaGating:
     def test_anova_alpha_out_of_range_raises(self):
         """anova_alpha outside [0, 1] must raise ValueError at construction."""
         import pytest
+
         rng = np.random.default_rng(12)
         cat = rng.integers(0, 2, 100).astype(float).reshape(-1, 1)
         cont = rng.uniform(1, 80, (100, 1))
