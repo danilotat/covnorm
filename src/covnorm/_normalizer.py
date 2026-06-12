@@ -198,9 +198,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
                 f"Exceeded max continuous covariates ({RobustNormalizerConfig.MAX_CONTINUOUS})."
             )
         if not (0.0 <= self.anova_alpha <= 1.0):
-            raise ValueError(
-                f"anova_alpha must be in [0, 1]; got {self.anova_alpha}."
-            )
+            raise ValueError(f"anova_alpha must be in [0, 1]; got {self.anova_alpha}.")
 
     def fit(
         self, X: np.ndarray, y: Optional[np.ndarray] = None
@@ -289,11 +287,15 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
                 if len(valid_groups) >= 2:
                     _, p_anova = f_oneway(*valid_groups)
                     self._anova_pvalues_[col] = float(p_anova)
-                    apply_mu = (self.anova_alpha > 0.0) and (p_anova <= self.anova_alpha)
+                    apply_mu = (self.anova_alpha > 0.0) and (
+                        p_anova <= self.anova_alpha
+                    )
 
                     _, p_levene = levene(*valid_groups, center="median")
                     self._levene_pvalues_[col] = float(p_levene)
-                    apply_sigma = (self.anova_alpha > 0.0) and (p_levene <= self.anova_alpha)
+                    apply_sigma = (self.anova_alpha > 0.0) and (
+                        p_levene <= self.anova_alpha
+                    )
                 else:
                     self._anova_pvalues_[col] = np.nan
                     self._levene_pvalues_[col] = np.nan
@@ -302,7 +304,9 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
                     cat_tuple = tuple(unique_rows[i])
                     z_group = groups_z[i]
                     mu_cat = float(np.mean(z_group)) if apply_mu else 0.0
-                    sigma_cat = max(float(np.std(z_group)), 1e-6) if apply_sigma else 1.0
+                    sigma_cat = (
+                        max(float(np.std(z_group)), 1e-6) if apply_sigma else 1.0
+                    )
                     col_corrections[cat_tuple] = (mu_cat, sigma_cat)
             self._cat_corrections[col] = col_corrections
 
