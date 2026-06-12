@@ -4,7 +4,7 @@ import numpy as np
 from numpy.typing import ArrayLike
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import validate_data
-
+from scipy.stats import f_oneway, levene
 from covnorm._surface_fitter import ContinuousSurfaceFitter, RobustNormalizerConfig
 
 
@@ -59,6 +59,15 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         Box-Cox transformations, but in case of values equal to 0, the method
         will use any of the strategy here. Could be one of ``'eps'``,
         ``'yeojohnson'``.
+    anova_alpha : float, default=0.05
+        Significance level used for both the location gate
+        (``scipy.stats.f_oneway``) and the scale gate
+        (``scipy.stats.levene``). If the location p-value exceeds this
+        threshold, ``mu_cat`` is set to ``0.0`` for all groups. If the
+        scale p-value exceeds it, ``sigma_cat`` is set to ``1.0``. The
+        two decisions are independent. Set to ``0.0`` to always skip both
+        corrections; set to ``1.0`` to always apply both. Must be in
+        ``[0, 1]``.
 
     Attributes
     ----------
@@ -67,6 +76,15 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
     _cat_corrections : dict of int -> (dict of tuple -> (float, float))
         Per-marker-column mapping from categorical combination to
         ``(mu_cat, sigma_cat)`` correction parameters.
+    _anova_pvalues_ : dict of int -> float
+        Per-marker-column p-value from ``scipy.stats.f_oneway`` over
+        ``z_base`` across categorical groups (location gate). ``np.nan``
+        when no categorical covariate is present, when there is only one
+        group, or when all but one group contain a single sample.
+    _levene_pvalues_ : dict of int -> float
+        Per-marker-column p-value from ``scipy.stats.levene`` (center=
+        ``'median'``) over ``z_base`` across categorical groups (scale
+        gate). Same ``np.nan`` conditions as ``_anova_pvalues_``.
 
     Notes
     -----
@@ -113,6 +131,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         log_transform_continuous: bool = False,
         bin_size: int = 120,
         zero_handles: str = "eps",
+        anova_alpha: float = 0.05,
     ):
         self.categorical_vals = categorical_vals
         self.continuous_vals = continuous_vals
@@ -122,6 +141,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         self.log_transform_continuous = log_transform_continuous
         self.bin_size = bin_size
         self.zero_handles = zero_handles
+        self.anova_alpha = anova_alpha
         self._fitters: Dict[int, ContinuousSurfaceFitter] = {}
         self._cat_corrections: Dict[int, Dict[Tuple, Tuple[float, float]]] = {}
         self._cat_encoders: Dict[int, Dict] = {}
@@ -177,6 +197,10 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             raise ValueError(
                 f"Exceeded max continuous covariates ({RobustNormalizerConfig.MAX_CONTINUOUS})."
             )
+        if not (0.0 <= self.anova_alpha <= 1.0):
+            raise ValueError(
+                f"anova_alpha must be in [0, 1]; got {self.anova_alpha}."
+            )
 
     def fit(
         self, X: np.ndarray, y: Optional[np.ndarray] = None
@@ -229,6 +253,8 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
 
         self._fitters = {}
         self._cat_corrections = {}
+        self._anova_pvalues_: Dict[int, float] = {}
+        self._levene_pvalues_: Dict[int, float] = {}
 
         for col in range(X.shape[1]):
             y_all = X[:, col]
@@ -250,13 +276,33 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
 
             col_corrections: Dict[Tuple, Tuple[float, float]] = {}
             if cat_data.shape[1] == 0:
+                self._anova_pvalues_[col] = np.nan
+                self._levene_pvalues_[col] = np.nan
                 col_corrections[tuple()] = (0.0, 1.0)
             else:
-                for i in range(len(unique_rows)):
+                n_groups = len(unique_rows)
+                groups_z = [z_base_all[inverse_indices == i] for i in range(n_groups)]
+                valid_groups = [g for g in groups_z if len(g) >= 2]
+
+                apply_mu = False
+                apply_sigma = False
+                if len(valid_groups) >= 2:
+                    _, p_anova = f_oneway(*valid_groups)
+                    self._anova_pvalues_[col] = float(p_anova)
+                    apply_mu = (self.anova_alpha > 0.0) and (p_anova <= self.anova_alpha)
+
+                    _, p_levene = levene(*valid_groups, center="median")
+                    self._levene_pvalues_[col] = float(p_levene)
+                    apply_sigma = (self.anova_alpha > 0.0) and (p_levene <= self.anova_alpha)
+                else:
+                    self._anova_pvalues_[col] = np.nan
+                    self._levene_pvalues_[col] = np.nan
+
+                for i in range(n_groups):
                     cat_tuple = tuple(unique_rows[i])
-                    z_group = z_base_all[inverse_indices == i]
-                    mu_cat = float(np.mean(z_group))
-                    sigma_cat = max(float(np.std(z_group)), 1e-6)
+                    z_group = groups_z[i]
+                    mu_cat = float(np.mean(z_group)) if apply_mu else 0.0
+                    sigma_cat = max(float(np.std(z_group)), 1e-6) if apply_sigma else 1.0
                     col_corrections[cat_tuple] = (mu_cat, sigma_cat)
             self._cat_corrections[col] = col_corrections
 
