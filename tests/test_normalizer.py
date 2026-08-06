@@ -681,18 +681,23 @@ def test_fit_survives_outlier_mask_collapsing_to_empty():
     # 99% of samples share the same near-zero floor value; the rest are
     # scattered small positive values (mimics a below-detection-limit marker).
     y = np.where(rng.random(n) < 0.99, 1e-3, rng.integers(1, 20, n) / 100.0)
-    X = np.column_stack([
-        rng.integers(2600, 4500, n).astype(float),  # e.g. weight-like covariate
-        rng.integers(38, 43, n).astype(float),       # e.g. gestational-week-like covariate
-    ])
+    X = np.column_stack(
+        [
+            rng.integers(2600, 4500, n).astype(float),  # weight-like covariate
+            rng.integers(38, 43, n).astype(float),  # gestational-week-like covariate
+        ]
+    )
     fitter = ContinuousSurfaceFitter(
-        n_bins=20, degree=3, n_iterations=3, bin_size=200, zero_handles="eps")
+        n_bins=20, degree=3, n_iterations=3, bin_size=200, zero_handles="eps"
+    )
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+    with pytest.warns(
+        UserWarning, match="Outlier rejection would remove all remaining samples"
+    ):
         fitter.fit(X, y)  # must not raise IndexError
 
     assert fitter._is_fitted
+    assert fitter.bin_centers_ is not None
 
 
 def test_create_knn_bins_empty_input_returns_empty_lists():

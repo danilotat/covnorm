@@ -394,6 +394,11 @@ class ContinuousSurfaceFitter:
             Median covariate values per valid window, shape (n_valid, 2).
         mu_estimates : list of float
         sigma_estimates : list of float
+
+        Notes
+        -----
+        Returns three empty lists when ``y`` has zero rows, instead of
+        raising, so callers can degrade gracefully on an empty input.
         """
         n = len(y)
         if n == 0:
