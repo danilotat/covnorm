@@ -8,17 +8,39 @@ from scipy.stats import f_oneway, levene
 from covnorm._surface_fitter import ContinuousSurfaceFitter, RobustNormalizerConfig
 
 
+def _robust_scale(values: np.ndarray) -> float:
+    """Median absolute deviation, rescaled to a normal-consistent sigma.
+
+    ``sigma_cat`` divides every sample of a column, so estimating it with
+    ``np.std`` is unsafe: one extreme ``z_base`` -- e.g. from a covariate value
+    where the polynomial scale surface is invalid -- inflates it without bound and
+    the column silently goes blind (a z-score spread of ~1e-5 instead of ~1). The
+    MAD ignores such a value.
+
+    Falls back to ``np.std`` when the MAD is zero, which happens legitimately on a
+    heavily zero-inflated column where most samples share one value; dividing by a
+    zero MAD would be its own catastrophe.
+    """
+    values = np.asarray(values, dtype=float)
+    mad = float(np.median(np.abs(values - np.median(values))))
+    if mad > 0.0:
+        return 1.4826 * mad
+    return float(np.std(values))
+
+
 class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
     """Robust conditional Z-score normalization over categorical and continuous covariates.
 
     A single polynomial surface is fitted across the entire dataset (ignoring
     categorical groups during curve fitting). Base Z-scores are then computed
     for all samples using this shared surface. A post-hoc correction is applied
-    per categorical group: the mean (``mu_cat``) and standard deviation
+    per categorical group: the median (``mu_cat``) and MAD-based scale
     (``sigma_cat``) of the base Z-scores within each group are subtracted and
     divided out, yielding ``Z_corrected = (Z_base - mu_cat) / sigma_cat``. This
     avoids the severe overfitting that arises from fitting independent surfaces
-    per group.
+    per group. Both are robust estimators on purpose -- ``sigma_cat`` divides
+    every sample of the column, so a mean/standard-deviation pair would let one
+    extreme ``z_base`` blind the whole column (see :func:`_robust_scale`).
 
     Outlier-robust estimation (iterative conditional Z-score fence + Q-Q
     regression on Box-Cox transformed values) is applied within each rolling
@@ -303,9 +325,9 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
                 for i in range(n_groups):
                     cat_tuple = tuple(unique_rows[i])
                     z_group = groups_z[i]
-                    mu_cat = float(np.mean(z_group)) if apply_mu else 0.0
+                    mu_cat = float(np.median(z_group)) if apply_mu else 0.0
                     sigma_cat = (
-                        max(float(np.std(z_group)), 1e-6) if apply_sigma else 1.0
+                        max(_robust_scale(z_group), 1e-6) if apply_sigma else 1.0
                     )
                     col_corrections[cat_tuple] = (mu_cat, sigma_cat)
             self._cat_corrections[col] = col_corrections
