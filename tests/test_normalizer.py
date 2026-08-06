@@ -663,3 +663,50 @@ class TestAnovaGating:
                 continuous_vals=cont,
                 anova_alpha=-0.1,
             )
+
+
+def test_fit_survives_outlier_mask_collapsing_to_empty():
+    """Regression test for a crash in the iterative outlier-rejection loop.
+
+    A near-degenerate target (e.g. a zero-inflated marker, >99% identical
+    values) can drive every bin's sigma estimate down to the 1e-6 floor
+    after the first pruning pass. Any leftover residual then produces
+    Z-scores in the tens of thousands, and the |Z| <= 3.372 mask can reject
+    every remaining sample. The next iteration used to call
+    `_create_knn_bins` on a zero-row array and crash with IndexError.
+    `fit` must degrade gracefully instead (see MASKCOLLAPSE.md).
+    """
+    rng = np.random.default_rng(0)
+    n = 1000
+    # 99% of samples share the same near-zero floor value; the rest are
+    # scattered small positive values (mimics a below-detection-limit marker).
+    y = np.where(rng.random(n) < 0.99, 1e-3, rng.integers(1, 20, n) / 100.0)
+    X = np.column_stack([
+        rng.integers(2600, 4500, n).astype(float),  # e.g. weight-like covariate
+        rng.integers(38, 43, n).astype(float),       # e.g. gestational-week-like covariate
+    ])
+    fitter = ContinuousSurfaceFitter(
+        n_bins=20, degree=3, n_iterations=3, bin_size=200, zero_handles="eps")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fitter.fit(X, y)  # must not raise IndexError
+
+    assert fitter._is_fitted
+
+
+def test_create_knn_bins_empty_input_returns_empty_lists():
+    """_create_knn_bins must degrade gracefully on zero rows, matching
+    _create_rolling_bins' existing behaviour for the same input, instead of
+    raising IndexError from indexing an empty array.
+    """
+    fitter = ContinuousSurfaceFitter(n_bins=20, bin_size=200)
+    fitter.lambda_ = 0.4
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        centers, mus, sigmas = fitter._create_knn_bins(np.empty((0, 2)), np.empty(0))
+
+    assert centers == []
+    assert mus == []
+    assert sigmas == []
