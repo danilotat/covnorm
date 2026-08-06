@@ -235,6 +235,14 @@ class ContinuousSurfaceFitter:
 
             if mask.all():
                 break
+            if not mask.any():
+                warnings.warn(
+                    "Outlier rejection would remove all remaining samples "
+                    "(the iterative refit degenerated, likely because the "
+                    "target is near-constant); keeping this iteration's fit "
+                    "instead of continuing."
+                )
+                break
             y_work = y_work[mask]
             X_work = X_work[mask]
 
@@ -386,8 +394,15 @@ class ContinuousSurfaceFitter:
             Median covariate values per valid window, shape (n_valid, 2).
         mu_estimates : list of float
         sigma_estimates : list of float
+
+        Notes
+        -----
+        Returns three empty lists when ``y`` has zero rows, instead of
+        raising, so callers can degrade gracefully on an empty input.
         """
         n = len(y)
+        if n == 0:
+            return [], [], []
         x_std = X.std(axis=0)
         x_std[x_std < 1e-8] = 1.0
         X_scaled = (X - X.mean(axis=0)) / x_std
