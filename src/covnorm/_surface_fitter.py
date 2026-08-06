@@ -396,6 +396,8 @@ class ContinuousSurfaceFitter:
         sigma_estimates : list of float
         """
         n = len(y)
+        if n == 0:
+            return [], [], []
         x_std = X.std(axis=0)
         x_std[x_std < 1e-8] = 1.0
         X_scaled = (X - X.mean(axis=0)) / x_std
