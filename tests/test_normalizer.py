@@ -715,3 +715,90 @@ def test_create_knn_bins_empty_input_returns_empty_lists():
     assert centers == []
     assert mus == []
     assert sigmas == []
+
+
+# ---------------------------------------------------------------------------
+# Regression: a single pathological reference row must not blind a marker
+# ---------------------------------------------------------------------------
+
+
+def test_marginal_estimates_are_available_after_a_successful_surface_fit(rng=RNG):
+    """`marginal_mu_`/`marginal_sigma_` are the degradation target when the
+    polynomial surface turns out to be invalid at some covariate value, so they
+    must be populated even when the surface itself fitted fine (the
+    `_global_*` pair is only meaningful on the `_fit_fallback` path)."""
+    X = rng.uniform(0, 100, (300, 1))
+    y = rng.gamma(2.0, 1.0, 300)
+    fitter = ContinuousSurfaceFitter(n_bins=6, degree=2)
+    fitter.fit(X, y)
+
+    assert fitter._is_fitted
+    assert np.isfinite(fitter.marginal_mu_)
+    assert fitter.marginal_sigma_ > 0
+
+
+def test_predict_mu_sigma_substitutes_marginal_when_sigma_is_non_positive(rng=RNG):
+    """A polynomial that predicts sigma <= 0 is invalid at that covariate value,
+    not evidence of a vanishing scale. Flooring it at 1e-6 turns "the model does
+    not apply here" into a Z-score of ~1e6; degrade to the marginal fit instead."""
+    X = rng.uniform(0, 100, (300, 1))
+    y = rng.gamma(2.0, 1.0, 300)
+    fitter = ContinuousSurfaceFitter(n_bins=6, degree=2)
+    fitter.fit(X, y)
+
+    # Force the scale surface negative everywhere (X and its powers are positive).
+    fitter.sigma_model.coef_ = -np.abs(fitter.sigma_model.coef_) - 1.0
+
+    with pytest.warns(UserWarning, match="non-positive sigma"):
+        mu, sigma = fitter.predict_mu_sigma(X)
+
+    assert np.all(sigma > 0)
+    np.testing.assert_allclose(sigma, fitter.marginal_sigma_)
+    # mu from the same invalid surface is not trustworthy either
+    np.testing.assert_allclose(mu, fitter.marginal_mu_)
+
+
+def test_categorical_correction_survives_one_extreme_reference_row(monkeypatch):
+    """`sigma_cat` is estimated from the reference `z_base`, so a non-robust
+    np.std lets a single extreme row inflate it by orders of magnitude. Every
+    sample for that column is then divided by the inflated value and the column
+    silently goes blind -- it can no longer flag anything.
+
+    In practice the extreme `z_base` comes from an unsupported covariate corner
+    where the scale surface is invalid, so it is injected here directly: this
+    pins the correction as robust independently of whatever produced the outlier.
+    anova_alpha=1.0 forces both corrections on, exercising the estimator rather
+    than the gating."""
+    rng = np.random.default_rng(3)
+    n = 600
+    cat = np.repeat([0.0, 1.0], n // 2).reshape(-1, 1)
+    cont = rng.uniform(1, 80, (n, 1))
+    marker = rng.gamma(2, 10, (n, 1))
+
+    unpatched = ContinuousSurfaceFitter.predict_mu_sigma
+
+    def one_invalid_scale(self, X_cont):
+        mu, sigma = unpatched(self, X_cont)
+        if len(sigma) == n:  # the reference pass, not a later transform
+            sigma = sigma.copy()
+            sigma[0] = 1e-6
+        return mu, sigma
+
+    monkeypatch.setattr(ContinuousSurfaceFitter, "predict_mu_sigma", one_invalid_scale)
+
+    norm = RobustConditionalNormalizer(
+        categorical_vals=cat, continuous_vals=cont, anova_alpha=1.0
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        norm.fit(marker)
+
+    _, sigma_cat = norm._cat_corrections[0][(0.0,)]
+    assert sigma_cat < 5.0, f"one row inflated sigma_cat to {sigma_cat:.4g}"
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        z = norm.transform(marker, categorical_vals=cat, continuous_vals=cont)
+
+    clean = z[1 : n // 2, 0]  # the untouched rows of the poisoned group
+    assert clean.std() > 0.3, f"marker went blind: z-score std={clean.std():.4g}"

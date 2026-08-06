@@ -110,6 +110,12 @@ class ContinuousSurfaceFitter:
         Q-Q regression mu estimate for each bin in ``bin_centers_``.
     bin_sigma_ : ndarray of shape (n_bins,) or None
         Q-Q regression sigma estimate for each bin in ``bin_centers_``.
+    marginal_mu_ : float or None
+        Covariate-free mu (in Box-Cox space) over the whole training target.
+        ``None`` until :meth:`fit` is called. Used by :meth:`predict_mu_sigma` as
+        the fallback where the polynomial surface predicts an invalid scale.
+    marginal_sigma_ : float or None
+        Covariate-free sigma counterpart of ``marginal_mu_``, floored at ``1e-6``.
 
     Notes
     -----
@@ -149,6 +155,8 @@ class ContinuousSurfaceFitter:
         self.bin_centers_: Optional[np.ndarray] = None
         self.bin_mu_: Optional[np.ndarray] = None
         self.bin_sigma_: Optional[np.ndarray] = None
+        self.marginal_mu_: Optional[float] = None
+        self.marginal_sigma_: Optional[float] = None
 
     def fit(self, X_cont: np.ndarray, y: np.ndarray) -> "ContinuousSurfaceFitter":
         """Fit the polynomial mu/sigma curve to rolling window estimates.
@@ -187,6 +195,18 @@ class ContinuousSurfaceFitter:
 
         if self.lambda_ is None:
             self.lambda_ = self._find_lambda_grid_search(y)
+
+        # Covariate-free (mu, sigma) over the whole training target, always. This is
+        # the degradation target for :meth:`predict_mu_sigma` when the polynomial
+        # surface turns out to be invalid at some covariate value; the ``_global_*``
+        # pair cannot serve that role because it is only populated on the
+        # ``_fit_fallback`` path and otherwise keeps its (0.0, 1.0) defaults.
+        m_mu, m_sigma = self._robust_qq_estimation(y, self.lambda_)
+        if m_mu is None or m_sigma is None:
+            y_bc_full = self._transform(y, self.lambda_)
+            m_mu, m_sigma = float(np.mean(y_bc_full)), float(np.std(y_bc_full))
+        self.marginal_mu_ = float(m_mu)
+        self.marginal_sigma_ = max(float(m_sigma), 1e-6)
 
         if n_features == 0:
             self._fit_fallback(y)
@@ -264,6 +284,20 @@ class ContinuousSurfaceFitter:
             Predicted location parameter (in Box-Cox space) for each sample.
         sigma : ndarray of shape (n_samples,)
             Predicted scale parameter (in Box-Cox space). Always positive.
+
+        Warns
+        -----
+        UserWarning
+            When the polynomial predicts a non-positive or non-finite scale for
+            one or more samples. Such a sample sits where the surface is not
+            supported by the training covariates -- the polynomial is extrapolating
+            and the prediction is invalid, rather than describing a genuinely
+            vanishing scale. Both ``mu`` and ``sigma`` degrade to the marginal fit
+            there: clamping ``sigma`` to a small floor instead would turn "the
+            model does not apply here" into a Z-score of ~1e6, and because
+            :meth:`RobustConditionalNormalizer.fit` estimates its per-group
+            correction from these Z-scores, a single such sample in the reference
+            would blind the whole column.
         """
         if not self._is_fitted or X_cont.shape[1] == 0:
             return (
@@ -273,7 +307,20 @@ class ContinuousSurfaceFitter:
         if self.log_transform_continuous:
             X_cont = np.log10(X_cont)
         X_poly = self.poly_transformer.transform(X_cont)
-        return self.mu_model.predict(X_poly), self.sigma_model.predict(X_poly)
+        mu = self.mu_model.predict(X_poly)
+        sigma = self.sigma_model.predict(X_poly)
+
+        invalid = ~np.isfinite(sigma) | (sigma <= 0.0) | ~np.isfinite(mu)
+        if invalid.any():
+            warnings.warn(
+                f"Polynomial surface predicted non-positive sigma for "
+                f"{int(invalid.sum())} of {invalid.size} samples; those covariate "
+                f"values are outside the region the surface supports. Falling back "
+                f"to the marginal (covariate-free) fit for them."
+            )
+            mu = np.where(invalid, self.marginal_mu_, mu)
+            sigma = np.where(invalid, self.marginal_sigma_, sigma)
+        return mu, sigma
 
     def _transform(self, data: np.ndarray, lambda_: float) -> np.ndarray:
         """Apply Box-Cox or Yeo-Johnson transform, honouring zero_handles."""
