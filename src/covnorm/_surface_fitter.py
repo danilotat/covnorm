@@ -235,6 +235,14 @@ class ContinuousSurfaceFitter:
 
             if mask.all():
                 break
+            if not mask.any():
+                warnings.warn(
+                    "Outlier rejection would remove all remaining samples "
+                    "(the iterative refit degenerated, likely because the "
+                    "target is near-constant); keeping this iteration's fit "
+                    "instead of continuing."
+                )
+                break
             y_work = y_work[mask]
             X_work = X_work[mask]
 
