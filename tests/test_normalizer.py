@@ -90,6 +90,7 @@ def test_get_params():
     assert "target_col" not in params
     assert params["n_bins"] == 8
     assert params["degree"] == 3
+    assert params["anchor_strategy"] == "farthest_point"
 
 
 def test_set_params():
@@ -700,12 +701,14 @@ def test_fit_survives_outlier_mask_collapsing_to_empty():
     assert fitter.bin_centers_ is not None
 
 
-def test_create_knn_bins_empty_input_returns_empty_lists():
+@pytest.mark.parametrize("strategy", ["farthest_point", "projection_rank"])
+def test_create_knn_bins_empty_input_returns_empty_lists(strategy):
     """_create_knn_bins must degrade gracefully on zero rows, matching
     _create_rolling_bins' existing behaviour for the same input, instead of
-    raising IndexError from indexing an empty array.
+    raising IndexError from indexing an empty array. The zero-row guard runs
+    ahead of anchor selection, so it holds for either strategy.
     """
-    fitter = ContinuousSurfaceFitter(n_bins=20, bin_size=200)
+    fitter = ContinuousSurfaceFitter(n_bins=20, bin_size=200, anchor_strategy=strategy)
     fitter.lambda_ = 0.4
 
     with warnings.catch_warnings():
@@ -715,6 +718,144 @@ def test_create_knn_bins_empty_input_returns_empty_lists():
     assert centers == []
     assert mus == []
     assert sigmas == []
+
+
+# ---------------------------------------------------------------------------
+# k-NN window anchor selection (anchor_strategy)
+# ---------------------------------------------------------------------------
+
+
+def _ridge_and_off_curve_cloud():
+    """Already-scaled 2D cloud: a dense correlated ridge plus a sparse
+    off-ridge population. Mimics a growth curve (e.g. gestational week x birth
+    weight) with a genuine but under-represented off-curve group.
+
+    Returns (X_scaled, n_ridge); rows with index >= n_ridge are off-ridge.
+    """
+    rng = np.random.default_rng(11)
+    n_ridge, n_off = 800, 40
+    t = rng.uniform(-1.7, 1.7, n_ridge)
+    ridge = np.column_stack([t, t + rng.normal(0, 0.05, n_ridge)])
+    off = np.column_stack(
+        [rng.uniform(0.8, 1.8, n_off), rng.uniform(-1.8, -0.8, n_off)]
+    )
+    return np.vstack([ridge, off]), n_ridge
+
+
+def _min_pairwise_distance(points: np.ndarray) -> float:
+    d = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=-1)
+    return float(d[~np.eye(len(points), dtype=bool)].min())
+
+
+def test_farthest_point_anchors_reach_off_curve_observations():
+    """The reason farthest-point sampling exists: evenly spaced ranks are
+    evenly spaced in probability mass, so on a correlated covariate pair every
+    projection_rank anchor lands on the dense ridge and the polynomial surface
+    is unidentified off it. FPS spreads the anchors over the occupied region.
+    """
+    X_scaled, n_ridge = _ridge_and_off_curve_cloud()
+
+    rank_idx = ContinuousSurfaceFitter(
+        n_bins=30, anchor_strategy="projection_rank"
+    )._select_reference_points(X_scaled)
+    fps_idx = ContinuousSurfaceFitter(
+        n_bins=30, anchor_strategy="farthest_point"
+    )._select_reference_points(X_scaled)
+
+    assert int((rank_idx >= n_ridge).sum()) == 0
+    assert int((fps_idx >= n_ridge).sum()) > 0
+    assert _min_pairwise_distance(X_scaled[fps_idx]) > _min_pairwise_distance(
+        X_scaled[rank_idx]
+    )
+
+
+def test_projection_rank_reproduces_previous_anchor_selection():
+    """projection_rank must stay bit-identical to the pre-FPS selection so the
+    old behaviour really is reachable."""
+    X_scaled, _ = _ridge_and_off_curve_cloud()
+    n, n_bins = X_scaled.shape[0], 30
+
+    expected = np.unique(
+        np.argsort(X_scaled.sum(axis=1))[
+            np.round(np.linspace(0, n - 1, n_bins)).astype(int)
+        ]
+    )
+    got = ContinuousSurfaceFitter(
+        n_bins=n_bins, anchor_strategy="projection_rank"
+    )._select_reference_points(X_scaled)
+
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_farthest_point_selection_is_deterministic():
+    """Greedy FPS uses no RNG and argmin/argmax break ties by first index, so
+    repeated selections must be identical."""
+    X_scaled, _ = _ridge_and_off_curve_cloud()
+    first = ContinuousSurfaceFitter(
+        n_bins=30, anchor_strategy="farthest_point"
+    )._select_reference_points(X_scaled)
+    second = ContinuousSurfaceFitter(
+        n_bins=30, anchor_strategy="farthest_point"
+    )._select_reference_points(X_scaled)
+    np.testing.assert_array_equal(first, second)
+
+
+def test_farthest_point_anchors_are_observed_rows_and_capped():
+    """Anchors are real rows -- never synthetic points in an empty region --
+    and are capped at n_bins, degrading to at most n when rows are scarce."""
+    X_scaled, _ = _ridge_and_off_curve_cloud()
+    n = X_scaled.shape[0]
+
+    idx = ContinuousSurfaceFitter(
+        n_bins=30, anchor_strategy="farthest_point"
+    )._select_reference_points(X_scaled)
+    assert len(idx) == 30
+    assert idx.min() >= 0 and idx.max() < n
+
+    scarce = ContinuousSurfaceFitter(
+        n_bins=30, anchor_strategy="farthest_point"
+    )._select_reference_points(X_scaled[:5])
+    assert len(scarce) <= 5
+    assert len(np.unique(scarce)) == len(scarce)
+
+
+def test_unknown_anchor_strategy_raises():
+    rng = np.random.default_rng(3)
+    X = np.column_stack([rng.uniform(20, 80, 300), rng.uniform(1, 50, 300)])
+    y = rng.gamma(4.0, 2.0, 300)
+    fitter = ContinuousSurfaceFitter(n_bins=10, anchor_strategy="nearest_point")
+    with pytest.raises(ValueError, match="anchor_strategy"):
+        fitter.fit(X, y)
+
+
+def test_two_continuous_covariates_farthest_point_surface():
+    """End-to-end on the motivating shape (correlated covariate pair) with the
+    documented degree=2 / n_bins=30 pairing, and proof that the normalizer
+    forwards anchor_strategy to its per-marker fitters."""
+    rng = np.random.default_rng(5)
+    n = 900
+    week = rng.uniform(37.0, 42.0, n)
+    weight = 200.0 * week + rng.normal(0, 150.0, n)  # follows week: a growth curve
+    cont = np.column_stack([week, weight])
+    cat = rng.integers(0, 2, (n, 1)).astype(float)
+    markers = rng.gamma(4.0, 2.0, (n, 1))
+
+    norm = RobustConditionalNormalizer(
+        categorical_vals=cat,
+        continuous_vals=cont,
+        n_bins=30,
+        degree=2,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        X_norm = norm.fit_transform(markers)
+
+    assert X_norm.shape == markers.shape
+    assert np.all(np.isfinite(X_norm[:, 0]))
+    fitter = norm._fitters[0]
+    assert fitter.anchor_strategy == "farthest_point"
+    assert fitter._is_fitted
+    assert fitter.bin_centers_.shape == (30, 2)
 
 
 # ---------------------------------------------------------------------------
