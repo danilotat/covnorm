@@ -34,7 +34,7 @@ normalizer = RobustConditionalNormalizer(
     continuous_vals=age,
     n_bins=6,                      # target number of rolling windows
     bin_size=120,                  # samples per rolling window
-    log_transform_continuous=True, # recommended when covariates span orders of magnitude
+    transform_continuous="zscore", # training-set Z-score for polynomial stability
 )
 
 marker_norm = normalizer.fit_transform(marker)
@@ -68,8 +68,16 @@ marker_new_norm = normalizer.transform(
 | `bin_size` | `120` | Samples per rolling window (Mørkved et al. use 120) |
 | `degree` | `3` | Polynomial degree of the mu/sigma curve |
 | `n_iterations` | `3` | Maximum iterative conditional outlier-removal passes |
-| `log_transform_continuous` | `False` | Apply log10 to the continuous covariate before fitting (recommended when it spans orders of magnitude, e.g. age in years) |
+| `transform_continuous` | `None` | Continuous-covariate transform: `None` keeps the original values, `"log10"` applies a base-10 logarithm, and `"zscore"` subtracts the training mean and divides by the population standard deviation. Fitted parameters are reused at inference. |
+| `log_transform_continuous` | `False` | Backward-compatible alias for `transform_continuous="log10"`. Cannot be combined with `transform_continuous="zscore"`. |
 | `zero_handles` | `"eps"` | Strategy for zero values in the target: `"eps"` adds a small epsilon before Box-Cox; `"yeojohnson"` switches to Yeo-Johnson transform (supports zeros and negatives) |
+
+`transform_continuous` acts on the continuous covariates, whereas Box-Cox or
+Yeo-Johnson acts on each marker. The two transformations serve different
+purposes. `"zscore"` improves the numerical conditioning of polynomial
+features without changing the polynomial function class. `"log10"` is a
+non-linear modelling choice and requires all continuous covariates to be
+strictly positive.
 
 ## Plotting
 

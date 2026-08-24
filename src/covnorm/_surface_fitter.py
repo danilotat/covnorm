@@ -10,6 +10,28 @@ from sklearn.linear_model import LinearRegression
 from sklearn.neighbors import KDTree
 from sklearn.preprocessing import PolynomialFeatures
 
+_ANCHOR_STRATEGIES = ("farthest_point", "projection_rank")
+_CONTINUOUS_TRANSFORMS = (None, "log10", "zscore")
+
+
+def _resolve_continuous_transform(
+    transform_continuous: Optional[str], log_transform_continuous: bool
+) -> Optional[str]:
+    """Resolve the new transform option and its legacy boolean alias."""
+    if transform_continuous not in _CONTINUOUS_TRANSFORMS:
+        raise ValueError(
+            "transform_continuous must be one of None, 'log10', or 'zscore'; "
+            f"got {transform_continuous!r}."
+        )
+    if log_transform_continuous:
+        if transform_continuous not in (None, "log10"):
+            raise ValueError(
+                "log_transform_continuous=True conflicts with "
+                f"transform_continuous={transform_continuous!r}."
+            )
+        return "log10"
+    return transform_continuous
+
 
 @dataclass
 class RobustNormalizerConfig:
@@ -74,15 +96,48 @@ class ContinuousSurfaceFitter:
         Each pass refits the polynomial surface and removes samples whose
         conditional Z-score exceeds 3.372 in absolute value.
     log_transform_continuous : bool, default=False
-        When ``True``, ``log10`` is applied to all continuous covariate
-        columns at the start of :meth:`fit` and :meth:`predict_mu_sigma`.
-        Requires all covariate values to be strictly positive.
+        Legacy alias for ``transform_continuous='log10'``. Retained for
+        backward compatibility. It cannot be combined with
+        ``transform_continuous='zscore'``.
     bin_size : int, default=120
         Number of samples per rolling window. Mørkved et al. (2015) use 120.
     zero_handles: str, default=`eps`
         Strategy to handles zeros in input data. The default behavior is to use
         Box-Cox transformations, but in case of values equal to 0, the method
         will use any of the strategy here. Could be one of `eps`, `yeojohnson`
+    anchor_strategy : {'farthest_point', 'projection_rank'}, default='farthest_point'
+        How the k-NN window anchors are chosen when two continuous covariates
+        are used (ignored for a single covariate, which uses rolling windows).
+
+        ``'farthest_point'`` runs greedy farthest-point sampling in the scaled
+        covariate space: start from the observation closest to the centroid,
+        then repeatedly take the observation whose distance to the closest
+        already-chosen anchor is largest. The anchors spread over the occupied
+        region, so the polynomial surface is supported across the covariate
+        cloud rather than along one ridge.
+
+        ``'projection_rank'`` is the previous behaviour: sort by the sum of the
+        scaled columns and take evenly spaced rank positions. Evenly spaced
+        ranks are evenly spaced in probability mass, not in covariate space, so
+        on a correlated covariate pair (e.g. gestational week x birth weight,
+        whose mass follows a growth curve) every anchor lands on the dense
+        ridge and the surface is unidentified off it.
+
+        Both strategies only ever return observed rows, so no anchor sits in an
+        empty region. Farthest-point sampling is deterministic (no RNG) and
+        costs ``O(n_samples * n_bins)``. It is, by design, attracted to extreme
+        observations: a far-flung outlier becomes an anchor and its
+        ``bin_size`` nearest neighbours are then largely the same bulk points a
+        neighbouring anchor sees. Window coordinates stay the median of each
+        window's covariates, which pulls a boundary anchor's recorded center
+        back inside the cloud.
+    transform_continuous : {None, 'log10', 'zscore'}, default=None
+        Transformation applied to continuous covariates before binning and
+        polynomial feature construction. ``None`` preserves the original
+        values; ``'log10'`` applies the legacy base-10 logarithm and requires
+        strictly positive values; ``'zscore'`` applies a training-set Z-score
+        (subtract column mean and divide by column standard deviation). The
+        fitted centering parameters are reused unchanged at prediction time.
 
     Attributes
     ----------
@@ -116,6 +171,13 @@ class ContinuousSurfaceFitter:
         the fallback where the polynomial surface predicts an invalid scale.
     marginal_sigma_ : float or None
         Covariate-free sigma counterpart of ``marginal_mu_``, floored at ``1e-6``.
+    continuous_center_ : ndarray of shape (n_features,) or None
+        Training-set column means used by ``transform_continuous='zscore'``.
+        ``None`` for the other transformation modes.
+    continuous_scale_ : ndarray of shape (n_features,) or None
+        Training-set population standard deviations used by
+        ``transform_continuous='zscore'``. Near-constant columns receive scale
+        1.0. ``None`` for the other transformation modes.
 
     Notes
     -----
@@ -136,6 +198,8 @@ class ContinuousSurfaceFitter:
         log_transform_continuous: bool = False,
         bin_size: int = 120,
         zero_handles: str = "eps",
+        anchor_strategy: str = "farthest_point",
+        transform_continuous: Optional[str] = None,
     ):
         self.n_bins = n_bins
         self.degree = degree
@@ -152,6 +216,8 @@ class ContinuousSurfaceFitter:
         self._global_sigma: float = 1.0
         self._is_fitted: bool = False
         self.zero_handles = zero_handles
+        self.anchor_strategy = anchor_strategy
+        self.transform_continuous = transform_continuous
         self.bin_centers_: Optional[np.ndarray] = None
         self.bin_mu_: Optional[np.ndarray] = None
         self.bin_sigma_: Optional[np.ndarray] = None
@@ -167,8 +233,8 @@ class ContinuousSurfaceFitter:
             Continuous covariate matrix. Pass an array with zero columns
             (``n_features == 0``) to trigger the global fallback.
             Accepts one or two columns; two-column input uses k-NN binning.
-            All values must be strictly positive when
-            ``log_transform_continuous=True``.
+            All values must be strictly positive when the resolved continuous
+            transformation is ``'log10'``.
         y : ndarray of shape (n_samples,)
             Target values. Must be strictly positive (required by Box-Cox).
 
@@ -179,19 +245,22 @@ class ContinuousSurfaceFitter:
         Raises
         ------
         ValueError
-            If ``log_transform_continuous`` is ``True`` and any continuous
-            covariate value is <= 0.
+            If ``transform_continuous`` is invalid, if the resolved logarithmic
+            transformation receives a continuous covariate value <= 0, or if
+            ``anchor_strategy`` is not one of ``'farthest_point'`` /
+            ``'projection_rank'``.
         """
-        n_samples, n_features = X_cont.shape
+        # Checked here rather than in __init__ (sklearn convention) and for both
+        # covariate counts, so a typo fails fast instead of silently on the
+        # single-covariate path where the strategy is unused.
+        if self.anchor_strategy not in _ANCHOR_STRATEGIES:
+            raise ValueError(
+                f"anchor_strategy must be one of {_ANCHOR_STRATEGIES}; "
+                f"got {self.anchor_strategy!r}."
+            )
 
-        if self.log_transform_continuous and n_features > 0:
-            for c in range(n_features):
-                if np.any(X_cont[:, c] <= 0):
-                    raise ValueError(
-                        f"log_transform_continuous=True requires strictly positive "
-                        f"covariate values; column {c} contains values <= 0."
-                    )
-            X_cont = np.log10(X_cont)
+        _, n_features = X_cont.shape
+        X_cont = self._transform_continuous_covariates(X_cont, fit=True)
 
         if self.lambda_ is None:
             self.lambda_ = self._find_lambda_grid_search(y)
@@ -275,8 +344,8 @@ class ContinuousSurfaceFitter:
         ----------
         X_cont : ndarray of shape (n_samples, n_features)
             Continuous covariate matrix. Must have the same number of
-            columns as the array passed to :meth:`fit`. All values must
-            be strictly positive when ``log_transform_continuous=True``.
+            columns as the array passed to :meth:`fit`. All values must be
+            strictly positive when the fitted transformation is ``'log10'``.
 
         Returns
         -------
@@ -304,8 +373,7 @@ class ContinuousSurfaceFitter:
                 np.full(X_cont.shape[0], self._global_mu),
                 np.full(X_cont.shape[0], self._global_sigma),
             )
-        if self.log_transform_continuous:
-            X_cont = np.log10(X_cont)
+        X_cont = self._transform_continuous_covariates(X_cont, fit=False)
         X_poly = self.poly_transformer.transform(X_cont)
         mu = self.mu_model.predict(X_poly)
         sigma = self.sigma_model.predict(X_poly)
@@ -321,6 +389,43 @@ class ContinuousSurfaceFitter:
             mu = np.where(invalid, self.marginal_mu_, mu)
             sigma = np.where(invalid, self.marginal_sigma_, sigma)
         return mu, sigma
+
+    def _transform_continuous_covariates(
+        self, X_cont: np.ndarray, *, fit: bool
+    ) -> np.ndarray:
+        """Apply the configured continuous-covariate transformation.
+
+        ``'zscore'`` subtracts the training mean and divides by the training
+        population standard deviation. The fitted parameters are stored so
+        predictions never depend on the composition of the prediction batch.
+        """
+        if fit:
+            resolved = _resolve_continuous_transform(
+                self.transform_continuous, self.log_transform_continuous
+            )
+            self._resolved_transform_continuous_ = resolved
+            self.continuous_center_ = None
+            self.continuous_scale_ = None
+        else:
+            resolved = self._resolved_transform_continuous_
+
+        if resolved == "log10":
+            for c in range(X_cont.shape[1]):
+                if np.any(X_cont[:, c] <= 0):
+                    raise ValueError(
+                        "transform_continuous='log10' requires strictly positive "
+                        f"covariate values; column {c} contains values <= 0."
+                    )
+            return np.log10(X_cont)
+
+        if resolved == "zscore":
+            if fit:
+                self.continuous_center_ = np.mean(X_cont, axis=0)
+                scale = np.std(X_cont, axis=0)
+                self.continuous_scale_ = np.where(scale < 1e-8, 1.0, scale)
+            return (X_cont - self.continuous_center_) / self.continuous_scale_
+
+        return X_cont
 
     def _transform(self, data: np.ndarray, lambda_: float) -> np.ndarray:
         """Apply Box-Cox or Yeo-Johnson transform, honouring zero_handles."""
@@ -420,13 +525,65 @@ class ContinuousSurfaceFitter:
 
         return valid_centers, mu_estimates, sigma_estimates
 
+    def _select_reference_points(self, X_scaled: np.ndarray) -> np.ndarray:
+        """Pick the k-NN window anchors among the observed rows.
+
+        Parameters
+        ----------
+        X_scaled : ndarray of shape (n_samples, n_features)
+            Covariate matrix centred and scaled per column. Must have at least
+            one row.
+
+        Returns
+        -------
+        ref_idx : ndarray of shape (n_anchors,)
+            Sorted, unique row indices into ``X_scaled``. At most ``n_bins``
+            anchors, fewer when ``n_samples < n_bins`` or when a strategy picks
+            the same row twice.
+
+        Raises
+        ------
+        ValueError
+            If ``anchor_strategy`` is unknown. :meth:`fit` already rejects that,
+            so this only fires when the attribute is set after construction.
+        """
+        n = X_scaled.shape[0]
+
+        if self.anchor_strategy == "farthest_point":
+            # Greedy farthest-point sampling: seed at the most central
+            # observation, then repeatedly take the row whose distance to the
+            # nearest already-chosen anchor is largest. argmin/argmax return the
+            # first extremum, so the result is deterministic.
+            centroid = X_scaled.mean(axis=0)
+            chosen = [int(np.argmin(np.linalg.norm(X_scaled - centroid, axis=1)))]
+            dmin = np.linalg.norm(X_scaled - X_scaled[chosen[0]], axis=1)
+            # Capped at n: once every row is an anchor dmin is all-zero and
+            # further picks are duplicates that np.unique collapses anyway.
+            for _ in range(min(self.n_bins, n) - 1):
+                nxt = int(np.argmax(dmin))
+                chosen.append(nxt)
+                dmin = np.minimum(
+                    dmin, np.linalg.norm(X_scaled - X_scaled[nxt], axis=1)
+                )
+            return np.unique(chosen)
+
+        if self.anchor_strategy == "projection_rank":
+            proj_sorted_idx = np.argsort(X_scaled.sum(axis=1))
+            ref_positions = np.round(np.linspace(0, n - 1, self.n_bins)).astype(int)
+            return np.unique(proj_sorted_idx[ref_positions])
+
+        raise ValueError(
+            f"anchor_strategy must be one of {_ANCHOR_STRATEGIES}; "
+            f"got {self.anchor_strategy!r}."
+        )
+
     def _create_knn_bins(self, X: np.ndarray, y: np.ndarray) -> Tuple[List, List, List]:
         """Build k-NN overlapping windows for a 2D continuous covariate space.
 
-        Selects ``n_bins`` reference points by sorting data along a 1D projection
-        (sum of scaled columns) and taking evenly-spaced rank positions.  For each
-        reference point the ``bin_size`` nearest neighbours in the scaled 2D space
-        form a bin.  This avoids grid-based binning and the curse of dimensionality.
+        Selects up to ``n_bins`` reference points among the observed rows via
+        ``anchor_strategy`` (see the class docstring), then for each reference
+        point the ``bin_size`` nearest neighbours in the scaled 2D space form a
+        bin.  This avoids grid-based binning and the curse of dimensionality.
 
         Parameters
         ----------
@@ -454,10 +611,7 @@ class ContinuousSurfaceFitter:
         x_std[x_std < 1e-8] = 1.0
         X_scaled = (X - X.mean(axis=0)) / x_std
 
-        projection = X_scaled.sum(axis=1)
-        proj_sorted_idx = np.argsort(projection)
-        ref_positions = np.round(np.linspace(0, n - 1, self.n_bins)).astype(int)
-        ref_idx = np.unique(proj_sorted_idx[ref_positions])
+        ref_idx = self._select_reference_points(X_scaled)
 
         k = min(self.bin_size, n)
         tree = KDTree(X_scaled)
