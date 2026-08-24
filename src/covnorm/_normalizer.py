@@ -61,7 +61,11 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         windows (``RobustNormalizerConfig.MAX_CONTINUOUS == 2``).
         When two columns are used, set ``n_bins >= 10`` so that the number
         of valid centers meets the minimum for a degree-3 surface polynomial
-        (``comb(3+2, 2) == 10`` terms).
+        (``comb(3+2, 2) == 10`` terms). ``n_bins=30`` paired with ``degree=2``
+        (a lighter surface, needing only ``comb(2+2, 2) == 6`` centers) is a
+        good default for the two-column farthest-point path: it leaves ample
+        headroom for windows that fail the ``MIN_BIN_SAMPLES`` check or the
+        Q-Q estimation.
         Pass an empty list ``[]`` when there are no continuous covariates.
     n_bins : int, default=6
         Target number of rolling windows used to estimate the polynomial curve.
@@ -90,6 +94,15 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         two decisions are independent. Set to ``0.0`` to always skip both
         corrections; set to ``1.0`` to always apply both. Must be in
         ``[0, 1]``.
+    anchor_strategy : {'farthest_point', 'projection_rank'}, default='farthest_point'
+        How the k-NN window anchors are chosen when two continuous covariates
+        are used; ignored for zero or one continuous covariate. Forwarded to
+        :class:`~covnorm._surface_fitter.ContinuousSurfaceFitter`, whose
+        docstring documents both strategies. The default spreads the anchors
+        over the covariate cloud via farthest-point sampling;
+        ``'projection_rank'`` restores the previous evenly-spaced-rank
+        behaviour, which concentrates every anchor on the dense ridge of a
+        correlated covariate pair.
 
     Attributes
     ----------
@@ -154,6 +167,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         bin_size: int = 120,
         zero_handles: str = "eps",
         anova_alpha: float = 0.05,
+        anchor_strategy: str = "farthest_point",
     ):
         self.categorical_vals = categorical_vals
         self.continuous_vals = continuous_vals
@@ -164,6 +178,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         self.bin_size = bin_size
         self.zero_handles = zero_handles
         self.anova_alpha = anova_alpha
+        self.anchor_strategy = anchor_strategy
         self._fitters: Dict[int, ContinuousSurfaceFitter] = {}
         self._cat_corrections: Dict[int, Dict[Tuple, Tuple[float, float]]] = {}
         self._cat_encoders: Dict[int, Dict] = {}
@@ -286,6 +301,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
                 log_transform_continuous=self.log_transform_continuous,
                 bin_size=self.bin_size,
                 zero_handles=self.zero_handles,
+                anchor_strategy=self.anchor_strategy,
             )
             fitter.fit(cont_data, y_all)
             self._fitters[col] = fitter

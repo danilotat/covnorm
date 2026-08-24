@@ -10,6 +10,8 @@ from sklearn.linear_model import LinearRegression
 from sklearn.neighbors import KDTree
 from sklearn.preprocessing import PolynomialFeatures
 
+_ANCHOR_STRATEGIES = ("farthest_point", "projection_rank")
+
 
 @dataclass
 class RobustNormalizerConfig:
@@ -83,6 +85,32 @@ class ContinuousSurfaceFitter:
         Strategy to handles zeros in input data. The default behavior is to use
         Box-Cox transformations, but in case of values equal to 0, the method
         will use any of the strategy here. Could be one of `eps`, `yeojohnson`
+    anchor_strategy : {'farthest_point', 'projection_rank'}, default='farthest_point'
+        How the k-NN window anchors are chosen when two continuous covariates
+        are used (ignored for a single covariate, which uses rolling windows).
+
+        ``'farthest_point'`` runs greedy farthest-point sampling in the scaled
+        covariate space: start from the observation closest to the centroid,
+        then repeatedly take the observation whose distance to the closest
+        already-chosen anchor is largest. The anchors spread over the occupied
+        region, so the polynomial surface is supported across the covariate
+        cloud rather than along one ridge.
+
+        ``'projection_rank'`` is the previous behaviour: sort by the sum of the
+        scaled columns and take evenly spaced rank positions. Evenly spaced
+        ranks are evenly spaced in probability mass, not in covariate space, so
+        on a correlated covariate pair (e.g. gestational week x birth weight,
+        whose mass follows a growth curve) every anchor lands on the dense
+        ridge and the surface is unidentified off it.
+
+        Both strategies only ever return observed rows, so no anchor sits in an
+        empty region. Farthest-point sampling is deterministic (no RNG) and
+        costs ``O(n_samples * n_bins)``. It is, by design, attracted to extreme
+        observations: a far-flung outlier becomes an anchor and its
+        ``bin_size`` nearest neighbours are then largely the same bulk points a
+        neighbouring anchor sees. Window coordinates stay the median of each
+        window's covariates, which pulls a boundary anchor's recorded center
+        back inside the cloud.
 
     Attributes
     ----------
@@ -136,6 +164,7 @@ class ContinuousSurfaceFitter:
         log_transform_continuous: bool = False,
         bin_size: int = 120,
         zero_handles: str = "eps",
+        anchor_strategy: str = "farthest_point",
     ):
         self.n_bins = n_bins
         self.degree = degree
@@ -152,6 +181,7 @@ class ContinuousSurfaceFitter:
         self._global_sigma: float = 1.0
         self._is_fitted: bool = False
         self.zero_handles = zero_handles
+        self.anchor_strategy = anchor_strategy
         self.bin_centers_: Optional[np.ndarray] = None
         self.bin_mu_: Optional[np.ndarray] = None
         self.bin_sigma_: Optional[np.ndarray] = None
@@ -180,8 +210,18 @@ class ContinuousSurfaceFitter:
         ------
         ValueError
             If ``log_transform_continuous`` is ``True`` and any continuous
-            covariate value is <= 0.
+            covariate value is <= 0, or if ``anchor_strategy`` is not one of
+            ``'farthest_point'`` / ``'projection_rank'``.
         """
+        # Checked here rather than in __init__ (sklearn convention) and for both
+        # covariate counts, so a typo fails fast instead of silently on the
+        # single-covariate path where the strategy is unused.
+        if self.anchor_strategy not in _ANCHOR_STRATEGIES:
+            raise ValueError(
+                f"anchor_strategy must be one of {_ANCHOR_STRATEGIES}; "
+                f"got {self.anchor_strategy!r}."
+            )
+
         n_samples, n_features = X_cont.shape
 
         if self.log_transform_continuous and n_features > 0:
@@ -420,13 +460,65 @@ class ContinuousSurfaceFitter:
 
         return valid_centers, mu_estimates, sigma_estimates
 
+    def _select_reference_points(self, X_scaled: np.ndarray) -> np.ndarray:
+        """Pick the k-NN window anchors among the observed rows.
+
+        Parameters
+        ----------
+        X_scaled : ndarray of shape (n_samples, n_features)
+            Covariate matrix centred and scaled per column. Must have at least
+            one row.
+
+        Returns
+        -------
+        ref_idx : ndarray of shape (n_anchors,)
+            Sorted, unique row indices into ``X_scaled``. At most ``n_bins``
+            anchors, fewer when ``n_samples < n_bins`` or when a strategy picks
+            the same row twice.
+
+        Raises
+        ------
+        ValueError
+            If ``anchor_strategy`` is unknown. :meth:`fit` already rejects that,
+            so this only fires when the attribute is set after construction.
+        """
+        n = X_scaled.shape[0]
+
+        if self.anchor_strategy == "farthest_point":
+            # Greedy farthest-point sampling: seed at the most central
+            # observation, then repeatedly take the row whose distance to the
+            # nearest already-chosen anchor is largest. argmin/argmax return the
+            # first extremum, so the result is deterministic.
+            centroid = X_scaled.mean(axis=0)
+            chosen = [int(np.argmin(np.linalg.norm(X_scaled - centroid, axis=1)))]
+            dmin = np.linalg.norm(X_scaled - X_scaled[chosen[0]], axis=1)
+            # Capped at n: once every row is an anchor dmin is all-zero and
+            # further picks are duplicates that np.unique collapses anyway.
+            for _ in range(min(self.n_bins, n) - 1):
+                nxt = int(np.argmax(dmin))
+                chosen.append(nxt)
+                dmin = np.minimum(
+                    dmin, np.linalg.norm(X_scaled - X_scaled[nxt], axis=1)
+                )
+            return np.unique(chosen)
+
+        if self.anchor_strategy == "projection_rank":
+            proj_sorted_idx = np.argsort(X_scaled.sum(axis=1))
+            ref_positions = np.round(np.linspace(0, n - 1, self.n_bins)).astype(int)
+            return np.unique(proj_sorted_idx[ref_positions])
+
+        raise ValueError(
+            f"anchor_strategy must be one of {_ANCHOR_STRATEGIES}; "
+            f"got {self.anchor_strategy!r}."
+        )
+
     def _create_knn_bins(self, X: np.ndarray, y: np.ndarray) -> Tuple[List, List, List]:
         """Build k-NN overlapping windows for a 2D continuous covariate space.
 
-        Selects ``n_bins`` reference points by sorting data along a 1D projection
-        (sum of scaled columns) and taking evenly-spaced rank positions.  For each
-        reference point the ``bin_size`` nearest neighbours in the scaled 2D space
-        form a bin.  This avoids grid-based binning and the curse of dimensionality.
+        Selects up to ``n_bins`` reference points among the observed rows via
+        ``anchor_strategy`` (see the class docstring), then for each reference
+        point the ``bin_size`` nearest neighbours in the scaled 2D space form a
+        bin.  This avoids grid-based binning and the curse of dimensionality.
 
         Parameters
         ----------
@@ -454,10 +546,7 @@ class ContinuousSurfaceFitter:
         x_std[x_std < 1e-8] = 1.0
         X_scaled = (X - X.mean(axis=0)) / x_std
 
-        projection = X_scaled.sum(axis=1)
-        proj_sorted_idx = np.argsort(projection)
-        ref_positions = np.round(np.linspace(0, n - 1, self.n_bins)).astype(int)
-        ref_idx = np.unique(proj_sorted_idx[ref_positions])
+        ref_idx = self._select_reference_points(X_scaled)
 
         k = min(self.bin_size, n)
         tree = KDTree(X_scaled)
