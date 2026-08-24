@@ -11,6 +11,26 @@ from sklearn.neighbors import KDTree
 from sklearn.preprocessing import PolynomialFeatures
 
 _ANCHOR_STRATEGIES = ("farthest_point", "projection_rank")
+_CONTINUOUS_TRANSFORMS = (None, "log10", "zscore")
+
+
+def _resolve_continuous_transform(
+    transform_continuous: Optional[str], log_transform_continuous: bool
+) -> Optional[str]:
+    """Resolve the new transform option and its legacy boolean alias."""
+    if transform_continuous not in _CONTINUOUS_TRANSFORMS:
+        raise ValueError(
+            "transform_continuous must be one of None, 'log10', or 'zscore'; "
+            f"got {transform_continuous!r}."
+        )
+    if log_transform_continuous:
+        if transform_continuous not in (None, "log10"):
+            raise ValueError(
+                "log_transform_continuous=True conflicts with "
+                f"transform_continuous={transform_continuous!r}."
+            )
+        return "log10"
+    return transform_continuous
 
 
 @dataclass
@@ -76,9 +96,9 @@ class ContinuousSurfaceFitter:
         Each pass refits the polynomial surface and removes samples whose
         conditional Z-score exceeds 3.372 in absolute value.
     log_transform_continuous : bool, default=False
-        When ``True``, ``log10`` is applied to all continuous covariate
-        columns at the start of :meth:`fit` and :meth:`predict_mu_sigma`.
-        Requires all covariate values to be strictly positive.
+        Legacy alias for ``transform_continuous='log10'``. Retained for
+        backward compatibility. It cannot be combined with
+        ``transform_continuous='zscore'``.
     bin_size : int, default=120
         Number of samples per rolling window. Mørkved et al. (2015) use 120.
     zero_handles: str, default=`eps`
@@ -111,6 +131,13 @@ class ContinuousSurfaceFitter:
         neighbouring anchor sees. Window coordinates stay the median of each
         window's covariates, which pulls a boundary anchor's recorded center
         back inside the cloud.
+    transform_continuous : {None, 'log10', 'zscore'}, default=None
+        Transformation applied to continuous covariates before binning and
+        polynomial feature construction. ``None`` preserves the original
+        values; ``'log10'`` applies the legacy base-10 logarithm and requires
+        strictly positive values; ``'zscore'`` applies a training-set Z-score
+        (subtract column mean and divide by column standard deviation). The
+        fitted centering parameters are reused unchanged at prediction time.
 
     Attributes
     ----------
@@ -144,6 +171,13 @@ class ContinuousSurfaceFitter:
         the fallback where the polynomial surface predicts an invalid scale.
     marginal_sigma_ : float or None
         Covariate-free sigma counterpart of ``marginal_mu_``, floored at ``1e-6``.
+    continuous_center_ : ndarray of shape (n_features,) or None
+        Training-set column means used by ``transform_continuous='zscore'``.
+        ``None`` for the other transformation modes.
+    continuous_scale_ : ndarray of shape (n_features,) or None
+        Training-set population standard deviations used by
+        ``transform_continuous='zscore'``. Near-constant columns receive scale
+        1.0. ``None`` for the other transformation modes.
 
     Notes
     -----
@@ -165,6 +199,7 @@ class ContinuousSurfaceFitter:
         bin_size: int = 120,
         zero_handles: str = "eps",
         anchor_strategy: str = "farthest_point",
+        transform_continuous: Optional[str] = None,
     ):
         self.n_bins = n_bins
         self.degree = degree
@@ -182,6 +217,7 @@ class ContinuousSurfaceFitter:
         self._is_fitted: bool = False
         self.zero_handles = zero_handles
         self.anchor_strategy = anchor_strategy
+        self.transform_continuous = transform_continuous
         self.bin_centers_: Optional[np.ndarray] = None
         self.bin_mu_: Optional[np.ndarray] = None
         self.bin_sigma_: Optional[np.ndarray] = None
@@ -197,8 +233,8 @@ class ContinuousSurfaceFitter:
             Continuous covariate matrix. Pass an array with zero columns
             (``n_features == 0``) to trigger the global fallback.
             Accepts one or two columns; two-column input uses k-NN binning.
-            All values must be strictly positive when
-            ``log_transform_continuous=True``.
+            All values must be strictly positive when the resolved continuous
+            transformation is ``'log10'``.
         y : ndarray of shape (n_samples,)
             Target values. Must be strictly positive (required by Box-Cox).
 
@@ -209,9 +245,10 @@ class ContinuousSurfaceFitter:
         Raises
         ------
         ValueError
-            If ``log_transform_continuous`` is ``True`` and any continuous
-            covariate value is <= 0, or if ``anchor_strategy`` is not one of
-            ``'farthest_point'`` / ``'projection_rank'``.
+            If ``transform_continuous`` is invalid, if the resolved logarithmic
+            transformation receives a continuous covariate value <= 0, or if
+            ``anchor_strategy`` is not one of ``'farthest_point'`` /
+            ``'projection_rank'``.
         """
         # Checked here rather than in __init__ (sklearn convention) and for both
         # covariate counts, so a typo fails fast instead of silently on the
@@ -222,16 +259,8 @@ class ContinuousSurfaceFitter:
                 f"got {self.anchor_strategy!r}."
             )
 
-        n_samples, n_features = X_cont.shape
-
-        if self.log_transform_continuous and n_features > 0:
-            for c in range(n_features):
-                if np.any(X_cont[:, c] <= 0):
-                    raise ValueError(
-                        f"log_transform_continuous=True requires strictly positive "
-                        f"covariate values; column {c} contains values <= 0."
-                    )
-            X_cont = np.log10(X_cont)
+        _, n_features = X_cont.shape
+        X_cont = self._transform_continuous_covariates(X_cont, fit=True)
 
         if self.lambda_ is None:
             self.lambda_ = self._find_lambda_grid_search(y)
@@ -315,8 +344,8 @@ class ContinuousSurfaceFitter:
         ----------
         X_cont : ndarray of shape (n_samples, n_features)
             Continuous covariate matrix. Must have the same number of
-            columns as the array passed to :meth:`fit`. All values must
-            be strictly positive when ``log_transform_continuous=True``.
+            columns as the array passed to :meth:`fit`. All values must be
+            strictly positive when the fitted transformation is ``'log10'``.
 
         Returns
         -------
@@ -344,8 +373,7 @@ class ContinuousSurfaceFitter:
                 np.full(X_cont.shape[0], self._global_mu),
                 np.full(X_cont.shape[0], self._global_sigma),
             )
-        if self.log_transform_continuous:
-            X_cont = np.log10(X_cont)
+        X_cont = self._transform_continuous_covariates(X_cont, fit=False)
         X_poly = self.poly_transformer.transform(X_cont)
         mu = self.mu_model.predict(X_poly)
         sigma = self.sigma_model.predict(X_poly)
@@ -361,6 +389,43 @@ class ContinuousSurfaceFitter:
             mu = np.where(invalid, self.marginal_mu_, mu)
             sigma = np.where(invalid, self.marginal_sigma_, sigma)
         return mu, sigma
+
+    def _transform_continuous_covariates(
+        self, X_cont: np.ndarray, *, fit: bool
+    ) -> np.ndarray:
+        """Apply the configured continuous-covariate transformation.
+
+        ``'zscore'`` subtracts the training mean and divides by the training
+        population standard deviation. The fitted parameters are stored so
+        predictions never depend on the composition of the prediction batch.
+        """
+        if fit:
+            resolved = _resolve_continuous_transform(
+                self.transform_continuous, self.log_transform_continuous
+            )
+            self._resolved_transform_continuous_ = resolved
+            self.continuous_center_ = None
+            self.continuous_scale_ = None
+        else:
+            resolved = self._resolved_transform_continuous_
+
+        if resolved == "log10":
+            for c in range(X_cont.shape[1]):
+                if np.any(X_cont[:, c] <= 0):
+                    raise ValueError(
+                        "transform_continuous='log10' requires strictly positive "
+                        f"covariate values; column {c} contains values <= 0."
+                    )
+            return np.log10(X_cont)
+
+        if resolved == "zscore":
+            if fit:
+                self.continuous_center_ = np.mean(X_cont, axis=0)
+                scale = np.std(X_cont, axis=0)
+                self.continuous_scale_ = np.where(scale < 1e-8, 1.0, scale)
+            return (X_cont - self.continuous_center_) / self.continuous_scale_
+
+        return X_cont
 
     def _transform(self, data: np.ndarray, lambda_: float) -> np.ndarray:
         """Apply Box-Cox or Yeo-Johnson transform, honouring zero_handles."""

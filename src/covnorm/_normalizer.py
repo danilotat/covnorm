@@ -5,7 +5,11 @@ from numpy.typing import ArrayLike
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import validate_data
 from scipy.stats import f_oneway, levene
-from covnorm._surface_fitter import ContinuousSurfaceFitter, RobustNormalizerConfig
+from covnorm._surface_fitter import (
+    ContinuousSurfaceFitter,
+    RobustNormalizerConfig,
+    _resolve_continuous_transform,
+)
 
 
 def _robust_scale(values: np.ndarray) -> float:
@@ -76,8 +80,9 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         Maximum number of iterative conditional outlier-removal passes applied
         before the polynomial is finalised.
     log_transform_continuous : bool, default=False
-        When ``True``, ``log10`` is applied to continuous covariate columns
-        before fitting and prediction. Requires strictly positive values.
+        Legacy alias for ``transform_continuous='log10'``. Retained for
+        backward compatibility and incompatible with
+        ``transform_continuous='zscore'``.
     bin_size : int, default=120
         Number of samples per rolling window. Mørkved et al. (2015) use 120.
     zero_handles : str, default='eps'
@@ -103,6 +108,12 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         ``'projection_rank'`` restores the previous evenly-spaced-rank
         behaviour, which concentrates every anchor on the dense ridge of a
         correlated covariate pair.
+    transform_continuous : {None, 'log10', 'zscore'}, default=None
+        Transformation applied to every continuous covariate before binning
+        and polynomial fitting. ``None`` leaves values unchanged; ``'log10'``
+        applies the legacy logarithm; ``'zscore'`` applies a training-set
+        Z-score (mean 0, standard deviation 1) and reuses those parameters for
+        future samples.
 
     Attributes
     ----------
@@ -149,7 +160,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
     >>> norm = RobustConditionalNormalizer(
     ...     categorical_vals=sex,
     ...     continuous_vals=age,
-    ...     log_transform_continuous=True,
+    ...     transform_continuous="zscore",
     ... )
     >>> marker_norm = norm.fit_transform(marker)
     >>> marker_norm.shape
@@ -168,6 +179,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         zero_handles: str = "eps",
         anova_alpha: float = 0.05,
         anchor_strategy: str = "farthest_point",
+        transform_continuous: Optional[str] = None,
     ):
         self.categorical_vals = categorical_vals
         self.continuous_vals = continuous_vals
@@ -179,6 +191,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         self.zero_handles = zero_handles
         self.anova_alpha = anova_alpha
         self.anchor_strategy = anchor_strategy
+        self.transform_continuous = transform_continuous
         self._fitters: Dict[int, ContinuousSurfaceFitter] = {}
         self._cat_corrections: Dict[int, Dict[Tuple, Tuple[float, float]]] = {}
         self._cat_encoders: Dict[int, Dict] = {}
@@ -236,6 +249,9 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             )
         if not (0.0 <= self.anova_alpha <= 1.0):
             raise ValueError(f"anova_alpha must be in [0, 1]; got {self.anova_alpha}.")
+        _resolve_continuous_transform(
+            self.transform_continuous, self.log_transform_continuous
+        )
 
     def fit(
         self, X: np.ndarray, y: Optional[np.ndarray] = None
@@ -302,6 +318,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
                 bin_size=self.bin_size,
                 zero_handles=self.zero_handles,
                 anchor_strategy=self.anchor_strategy,
+                transform_continuous=self.transform_continuous,
             )
             fitter.fit(cont_data, y_all)
             self._fitters[col] = fitter
@@ -472,7 +489,7 @@ if __name__ == "__main__":
     norm = RobustConditionalNormalizer(
         categorical_vals=cat_col,
         continuous_vals=cont_col,
-        log_transform_continuous=True,
+        transform_continuous="log10",
     )
     markers_norm = norm.fit_transform(markers)
 

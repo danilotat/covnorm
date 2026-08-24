@@ -91,6 +91,7 @@ def test_get_params():
     assert params["n_bins"] == 8
     assert params["degree"] == 3
     assert params["anchor_strategy"] == "farthest_point"
+    assert params["transform_continuous"] is None
 
 
 def test_set_params():
@@ -438,6 +439,126 @@ def test_surface_fitter_sigma_strictly_positive(rng=RNG):
     fitter.fit(X_cont, y)
     _, sigma = fitter.predict_mu_sigma(X_cont)
     assert np.all(sigma > 0)
+
+
+# ---------------------------------------------------------------------------
+# Continuous-covariate transformations
+# ---------------------------------------------------------------------------
+
+
+def _make_two_covariate_surface_data(n=600, seed=123):
+    rng = np.random.default_rng(seed)
+    week = rng.uniform(24.0, 42.0, n)
+    weight = 180.0 * week - 3500.0 + rng.normal(0.0, 250.0, n)
+    X_cont = np.column_stack([weight, week])
+    weight_z = (weight - weight.mean()) / weight.std()
+    week_z = (week - week.mean()) / week.std()
+    y = np.exp(2.0 + 0.25 * weight_z - 0.15 * week_z + rng.normal(0.0, 0.2, n))
+    return X_cont, y
+
+
+def test_zscore_transform_uses_training_statistics_and_reuses_them_for_prediction():
+    X_cont, y = _make_two_covariate_surface_data()
+    fitter = ContinuousSurfaceFitter(
+        n_bins=30,
+        degree=2,
+        lambda_=0.0,
+        n_iterations=1,
+        transform_continuous="zscore",
+    ).fit(X_cont, y)
+
+    np.testing.assert_allclose(fitter.continuous_center_, X_cont.mean(axis=0))
+    np.testing.assert_allclose(fitter.continuous_scale_, X_cont.std(axis=0))
+
+    X_scaled = fitter._transform_continuous_covariates(X_cont, fit=False)
+    np.testing.assert_allclose(X_scaled.mean(axis=0), 0.0, atol=1e-14)
+    np.testing.assert_allclose(X_scaled.std(axis=0), 1.0, atol=1e-14)
+
+    # A row must receive the same transformation and prediction by itself as
+    # it does inside a larger batch: prediction must not refit the scaler.
+    mu_one, sigma_one = fitter.predict_mu_sigma(X_cont[[0]])
+    mu_batch, sigma_batch = fitter.predict_mu_sigma(X_cont[:20])
+    np.testing.assert_allclose(mu_one, mu_batch[[0]])
+    np.testing.assert_allclose(sigma_one, sigma_batch[[0]])
+
+
+def test_normalizer_forwards_zscore_transform_to_marker_fitters():
+    X_cont, y = _make_two_covariate_surface_data(seed=321)
+    normalizer = RobustConditionalNormalizer(
+        categorical_vals=np.empty((len(y), 0)),
+        continuous_vals=X_cont,
+        n_bins=30,
+        degree=2,
+        n_iterations=1,
+        transform_continuous="zscore",
+    )
+
+    z = normalizer.fit_transform(y.reshape(-1, 1))
+    fitter = normalizer._fitters[0]
+    assert fitter._resolved_transform_continuous_ == "zscore"
+    np.testing.assert_allclose(fitter.continuous_center_, X_cont.mean(axis=0))
+    np.testing.assert_allclose(fitter.continuous_scale_, X_cont.std(axis=0))
+    assert np.all(np.isfinite(z))
+
+
+def test_zscore_transform_is_invariant_to_positive_affine_units():
+    X_cont, y = _make_two_covariate_surface_data(seed=456)
+    X_other_units = X_cont * np.array([0.001, 10.0]) + np.array([2.0, -100.0])
+
+    kwargs = dict(
+        n_bins=30,
+        degree=2,
+        lambda_=0.0,
+        n_iterations=1,
+        transform_continuous="zscore",
+    )
+    original = ContinuousSurfaceFitter(**kwargs).fit(X_cont, y)
+    converted = ContinuousSurfaceFitter(**kwargs).fit(X_other_units, y)
+
+    mu_original, sigma_original = original.predict_mu_sigma(X_cont)
+    mu_converted, sigma_converted = converted.predict_mu_sigma(X_other_units)
+    np.testing.assert_allclose(mu_original, mu_converted, rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(sigma_original, sigma_converted, rtol=1e-10, atol=1e-10)
+
+
+def test_transform_continuous_log10_matches_legacy_boolean():
+    rng = np.random.default_rng(789)
+    X_cont = rng.uniform(1.0, 1000.0, (400, 1))
+    y = rng.gamma(3.0, 2.0, 400)
+    kwargs = dict(n_bins=8, degree=2, lambda_=0.2, n_iterations=1)
+
+    legacy = ContinuousSurfaceFitter(**kwargs, log_transform_continuous=True).fit(
+        X_cont, y
+    )
+    current = ContinuousSurfaceFitter(**kwargs, transform_continuous="log10").fit(
+        X_cont, y
+    )
+
+    np.testing.assert_allclose(legacy.bin_centers_, current.bin_centers_)
+    mu_legacy, sigma_legacy = legacy.predict_mu_sigma(X_cont)
+    mu_current, sigma_current = current.predict_mu_sigma(X_cont)
+    np.testing.assert_allclose(mu_legacy, mu_current)
+    np.testing.assert_allclose(sigma_legacy, sigma_current)
+
+
+def test_transform_continuous_validation_and_legacy_conflict():
+    cat = np.empty((10, 0))
+    cont = np.arange(10.0).reshape(-1, 1)
+
+    with pytest.raises(ValueError, match="transform_continuous must be one of"):
+        RobustConditionalNormalizer(
+            categorical_vals=cat,
+            continuous_vals=cont,
+            transform_continuous="standardize",
+        )
+
+    with pytest.raises(ValueError, match="conflicts"):
+        RobustConditionalNormalizer(
+            categorical_vals=cat,
+            continuous_vals=cont,
+            log_transform_continuous=True,
+            transform_continuous="zscore",
+        )
 
 
 # ---------------------------------------------------------------------------
