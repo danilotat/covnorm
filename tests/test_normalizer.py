@@ -17,6 +17,7 @@ import warnings
 
 import numpy as np
 import pytest
+from scipy import stats
 from sklearn.base import clone
 from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
@@ -716,6 +717,181 @@ def _make_data_with_negatives(n: int = 300, rng=None) -> tuple:
     X_cont = rng.uniform(20, 80, (n, 1))
     y = rng.normal(loc=5.0, scale=2.0, size=n)
     return X_cont, y
+
+
+def test_percentile_fit_excludes_zeros_and_logs_training_prevalence(caplog):
+    rng = np.random.default_rng(20260825)
+    n = 400
+    X_cont = rng.uniform(20.0, 80.0, (n, 1))
+    y = rng.gamma(2.0, 5.0, n)
+    zero_mask = np.zeros(n, dtype=bool)
+    zero_mask[rng.choice(n, size=80, replace=False)] = True
+    y[zero_mask] = 0.0
+
+    normalizer = RobustConditionalNormalizer(
+        categorical_vals=np.empty((n, 0)),
+        continuous_vals=X_cont,
+        n_bins=6,
+        degree=2,
+        n_iterations=1,
+        bin_size=40,
+    )
+    with caplog.at_level("INFO", logger="covnorm._normalizer"):
+        normalizer.fit(y.reshape(-1, 1))
+
+    expected_p0 = 80 / n
+    expected_zero_z = stats.norm.ppf(expected_p0 / 2.0)
+    assert normalizer.zero_counts_[0] == 80
+    assert normalizer.zero_fractions_[0] == pytest.approx(expected_p0)
+    assert normalizer.zero_zscores_[0] == pytest.approx(expected_zero_z)
+    assert "excluding 80/400 zero values" in caplog.text
+    assert "Phi^-1(p0/2)" in caplog.text
+
+    fitter = normalizer._fitters[0]
+    assert fitter.n_samples_seen_ == n
+    assert fitter.zero_count_ == 80
+    assert fitter.positive_count_ == 320
+
+    positive_fitter = ContinuousSurfaceFitter(
+        n_bins=6,
+        degree=2,
+        n_iterations=1,
+        bin_size=40,
+    ).fit(X_cont[~zero_mask], y[~zero_mask])
+    assert fitter.lambda_ == positive_fitter.lambda_
+    mu, sigma = fitter.predict_mu_sigma(X_cont)
+    positive_mu, positive_sigma = positive_fitter.predict_mu_sigma(X_cont)
+    np.testing.assert_allclose(mu, positive_mu)
+    np.testing.assert_allclose(sigma, positive_sigma)
+
+
+def test_percentile_transform_maps_zero_mass_and_positive_distribution():
+    rng = np.random.default_rng(101)
+    n = 300
+    X_cont = rng.uniform(20.0, 80.0, (n, 1))
+    y = rng.gamma(2.0, 5.0, n)
+    zero_mask = np.zeros(n, dtype=bool)
+    zero_mask[:60] = True
+    y[zero_mask] = 0.0
+
+    normalizer = RobustConditionalNormalizer(
+        categorical_vals=np.empty((n, 0)),
+        continuous_vals=X_cont,
+        n_bins=6,
+        degree=2,
+        n_iterations=1,
+        bin_size=40,
+    ).fit(y.reshape(-1, 1))
+    transformed = normalizer.transform(y.reshape(-1, 1))[:, 0]
+
+    p0 = 60 / n
+    expected_zero_z = stats.norm.ppf(p0 / 2.0)
+    np.testing.assert_allclose(transformed[zero_mask], expected_zero_z)
+
+    fitter = normalizer._fitters[0]
+    y_bc = fitter._transform(y[~zero_mask], fitter.lambda_)
+    mu, sigma = fitter.predict_mu_sigma(X_cont[~zero_mask])
+    positive_z = (y_bc - mu) / np.maximum(sigma, 1e-6)
+    expected_positive = stats.norm.ppf(p0 + (1.0 - p0) * stats.norm.cdf(positive_z))
+    np.testing.assert_allclose(transformed[~zero_mask], expected_positive)
+    assert np.all(transformed[~zero_mask] > expected_zero_z)
+    assert np.all(np.isfinite(transformed))
+
+
+def test_percentile_transform_reuses_training_p0_for_new_batch():
+    rng = np.random.default_rng(102)
+    n = 300
+    train_cont = rng.uniform(20.0, 80.0, (n, 1))
+    train_y = rng.gamma(2.0, 5.0, n)
+    train_y[:30] = 0.0
+    normalizer = RobustConditionalNormalizer(
+        categorical_vals=np.empty((n, 0)),
+        continuous_vals=train_cont,
+        n_bins=6,
+        degree=2,
+        n_iterations=1,
+        bin_size=40,
+    ).fit(train_y.reshape(-1, 1))
+
+    new_n = 40
+    new_cont = rng.uniform(20.0, 80.0, (new_n, 1))
+    new_y = rng.gamma(2.0, 5.0, new_n)
+    new_y[:20] = 0.0
+    transformed = normalizer.transform(
+        new_y.reshape(-1, 1),
+        categorical_vals=np.empty((new_n, 0)),
+        continuous_vals=new_cont,
+    )[:, 0]
+
+    expected_from_training = stats.norm.ppf((30 / n) / 2.0)
+    np.testing.assert_allclose(transformed[:20], expected_from_training)
+
+
+def test_percentile_transform_rejects_zero_unseen_during_fit():
+    rng = np.random.default_rng(103)
+    n = 200
+    train_cont = rng.uniform(20.0, 80.0, (n, 1))
+    train_y = rng.gamma(2.0, 5.0, (n, 1))
+    normalizer = RobustConditionalNormalizer(
+        categorical_vals=np.empty((n, 0)),
+        continuous_vals=train_cont,
+        n_bins=6,
+        degree=2,
+        n_iterations=1,
+        bin_size=40,
+    ).fit(train_y)
+
+    new_y = np.array([[0.0], [1.0]])
+    new_cont = np.array([[30.0], [40.0]])
+    with pytest.raises(ValueError, match="no zeros were observed during fit"):
+        normalizer.transform(
+            new_y,
+            categorical_vals=np.empty((2, 0)),
+            continuous_vals=new_cont,
+        )
+
+
+def test_percentile_fit_requires_two_positive_values():
+    X_cont = np.arange(20.0).reshape(-1, 1)
+    y = np.zeros(20)
+    y[-1] = 1.0
+    fitter = ContinuousSurfaceFitter(n_bins=6)
+
+    with pytest.raises(ValueError, match="at least two positive"):
+        fitter.fit(X_cont, y)
+
+
+def test_percentile_categorical_corrections_ignore_zeros():
+    rng = np.random.default_rng(104)
+    n = 400
+    cat = np.repeat([0.0, 1.0], n // 2).reshape(-1, 1)
+    cont = rng.uniform(20.0, 80.0, (n, 1))
+    y = rng.gamma(2.0, 5.0, (n, 1))
+    zero_mask = np.zeros(n, dtype=bool)
+    zero_mask[:80] = True
+    y[zero_mask] = 0.0
+
+    with_zeros = RobustConditionalNormalizer(
+        categorical_vals=cat,
+        continuous_vals=cont,
+        n_bins=6,
+        degree=2,
+        n_iterations=1,
+        bin_size=40,
+        anova_alpha=1.0,
+    ).fit(y)
+    positives_only = RobustConditionalNormalizer(
+        categorical_vals=cat[~zero_mask],
+        continuous_vals=cont[~zero_mask],
+        n_bins=6,
+        degree=2,
+        n_iterations=1,
+        bin_size=40,
+        anova_alpha=1.0,
+    ).fit(y[~zero_mask])
+
+    for group, expected in positives_only._cat_corrections[0].items():
+        np.testing.assert_allclose(with_zeros._cat_corrections[0][group], expected)
 
 
 def test_surface_fitter_eps_with_zeros():

@@ -12,6 +12,7 @@ from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 
 _ANCHOR_STRATEGIES = ("farthest_point", "projection_rank")
 _CONTINUOUS_TRANSFORMS = (None, "log10", "zscore")
+_ZERO_HANDLES = ("percentile", "eps", "yeojohnson")
 _SIGMA_FLOOR = 1e-6
 _LOG_SIGMA_FLOOR = float(np.log(_SIGMA_FLOOR))
 _ZSCORE_OUTLIER_THRESHOLD = 3.372
@@ -119,10 +120,12 @@ class ContinuousSurfaceFitter:
         ``transform_continuous='zscore'``.
     bin_size : int, default=120
         Number of samples per rolling window. Mørkved et al. (2015) use 120.
-    zero_handles: str, default=`eps`
-        Strategy to handles zeros in input data. The default behavior is to use
-        Box-Cox transformations, but in case of values equal to 0, the method
-        will use any of the strategy here. Could be one of `eps`, `yeojohnson`
+    zero_handles : {'percentile', 'eps', 'yeojohnson'}, default='percentile'
+        Strategy used when the target contains zeros. ``'percentile'`` excludes
+        zeros before estimating lambda and the surface; the parent normalizer
+        maps them to a training-derived percentile at transform time. ``'eps'``
+        retains the legacy ``1e-6`` offset. ``'yeojohnson'`` uses Yeo-Johnson
+        for every value and also supports negatives.
     anchor_strategy : {'farthest_point', 'projection_rank'}, default='farthest_point'
         How the k-NN window anchors are chosen when two continuous covariates
         are used (ignored for a single covariate, which uses rolling windows).
@@ -224,7 +227,7 @@ class ContinuousSurfaceFitter:
         n_iterations: int = 3,
         log_transform_continuous: bool = False,
         bin_size: int = 120,
-        zero_handles: str = "eps",
+        zero_handles: str = "percentile",
         anchor_strategy: str = "farthest_point",
         transform_continuous: Optional[str] = None,
         ridge_alpha: float = 0.05,
@@ -254,6 +257,9 @@ class ContinuousSurfaceFitter:
         self.marginal_mu_: Optional[float] = None
         self.marginal_sigma_: Optional[float] = None
         self._log_sigma_bounds_: Optional[Tuple[float, float]] = None
+        self.n_samples_seen_: Optional[int] = None
+        self.zero_count_: Optional[int] = None
+        self.positive_count_: Optional[int] = None
 
     def fit(self, X_cont: np.ndarray, y: np.ndarray) -> "ContinuousSurfaceFitter":
         """Fit the polynomial mu/sigma curve to rolling window estimates.
@@ -267,7 +273,9 @@ class ContinuousSurfaceFitter:
             All values must be strictly positive when the resolved continuous
             transformation is ``'log10'``.
         y : ndarray of shape (n_samples,)
-            Target values. Must be strictly positive (required by Box-Cox).
+            Target values. With ``zero_handles='percentile'``, zeros are
+            excluded before fitting and at least two positive values are
+            required. Negative values require ``zero_handles='yeojohnson'``.
 
         Returns
         -------
@@ -279,7 +287,8 @@ class ContinuousSurfaceFitter:
             If ``transform_continuous`` is invalid, if the resolved logarithmic
             transformation receives a continuous covariate value <= 0, or if
             ``anchor_strategy`` is not one of ``'farthest_point'`` /
-            ``'projection_rank'``.
+            ``'projection_rank'``, the zero strategy is invalid, or percentile
+            handling receives fewer than two positive values.
         """
         # Checked here rather than in __init__ (sklearn convention) and for both
         # covariate counts, so a typo fails fast instead of silently on the
@@ -288,6 +297,12 @@ class ContinuousSurfaceFitter:
             raise ValueError(
                 f"anchor_strategy must be one of {_ANCHOR_STRATEGIES}; "
                 f"got {self.anchor_strategy!r}."
+            )
+        zero_handles = self.zero_handles.lower()
+        if zero_handles not in _ZERO_HANDLES:
+            raise ValueError(
+                f"zero_handles must be one of {_ZERO_HANDLES}; "
+                f"got {self.zero_handles!r}."
             )
         if (
             not isinstance(self.ridge_alpha, (int, float, np.number))
@@ -303,6 +318,37 @@ class ContinuousSurfaceFitter:
         )
         if self.log_transform_continuous:
             _warn_log_transform_continuous_deprecated()
+
+        X_cont = np.asarray(X_cont, dtype=float)
+        y = np.asarray(y, dtype=float)
+        if X_cont.shape[0] != y.shape[0]:
+            raise ValueError(
+                f"X_cont has {X_cont.shape[0]} rows but y has {y.shape[0]}."
+            )
+
+        self.n_samples_seen_ = int(y.shape[0])
+        self.zero_count_ = int(np.count_nonzero(y == 0.0))
+        self.positive_count_ = int(np.count_nonzero(y > 0.0))
+
+        if zero_handles == "percentile":
+            if np.any(y < 0.0):
+                raise ValueError(
+                    "zero_handles='percentile' does not support negative target "
+                    "values; use zero_handles='yeojohnson'."
+                )
+            if self.positive_count_ < 2:
+                raise ValueError(
+                    "zero_handles='percentile' requires at least two positive "
+                    f"target values; got {self.positive_count_}."
+                )
+            positive_mask = y > 0.0
+            X_cont = X_cont[positive_mask]
+            y = y[positive_mask]
+        elif zero_handles == "eps" and np.any(y < 0.0):
+            raise ValueError(
+                "zero_handles='eps' does not support negative target values; "
+                "use zero_handles='yeojohnson'."
+            )
 
         _, n_features = X_cont.shape
         X_cont = self._transform_continuous_covariates(X_cont, fit=True)
@@ -501,11 +547,16 @@ class ContinuousSurfaceFitter:
 
     def _transform(self, data: np.ndarray, lambda_: float) -> np.ndarray:
         """Apply Box-Cox or Yeo-Johnson transform, honouring zero_handles."""
+        zero_handles = self.zero_handles.lower()
+        if zero_handles == "yeojohnson":
+            return yeojohnson(data, lmbda=lambda_)
+        if zero_handles == "eps" and np.any(data <= 0):
+            return boxcox(data + 1e-6, lmbda=lambda_)
         if np.any(data <= 0):
-            if self.zero_handles.lower() == "eps":
-                return boxcox(data + 1e-6, lmbda=lambda_)
-            else:
-                return yeojohnson(data, lmbda=lambda_)
+            raise ValueError(
+                "Box-Cox percentile handling requires strictly positive values; "
+                "zeros must be handled by RobustConditionalNormalizer."
+            )
         return boxcox(data, lmbda=lambda_)
 
     def _find_lambda_grid_search(self, y: np.ndarray, n_points: int = 41) -> float:
