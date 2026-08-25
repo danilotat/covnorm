@@ -1,16 +1,20 @@
+import logging
 import warnings
 from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 from numpy.typing import ArrayLike
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import validate_data
-from scipy.stats import f_oneway, levene
+from scipy.stats import f_oneway, levene, norm
 from covnorm._surface_fitter import (
     ContinuousSurfaceFitter,
     RobustNormalizerConfig,
+    _ZERO_HANDLES,
     _resolve_continuous_transform,
     _warn_log_transform_continuous_deprecated,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _robust_scale(values: np.ndarray) -> float:
@@ -91,11 +95,14 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         ``transform_continuous='zscore'``.
     bin_size : int, default=120
         Number of samples per rolling window. Mørkved et al. (2015) use 120.
-    zero_handles : str, default='eps'
-        Strategy to handle zeros in input data. The default behavior is to use
-        Box-Cox transformations, but in case of values equal to 0, the method
-        will use any of the strategy here. Could be one of ``'eps'``,
-        ``'yeojohnson'``.
+    zero_handles : {'percentile', 'eps', 'yeojohnson'}, default='percentile'
+        Strategy to handle zeros in input data. ``'percentile'`` excludes zeros
+        from lambda, surface, and categorical-correction fitting. At transform
+        time it treats zeros as the lowest tied mass: if their training
+        prevalence is ``p0``, they receive ``norm.ppf(p0 / 2)`` and positive
+        scores are mapped above that mass. ``'eps'`` retains the legacy
+        ``1e-6`` Box-Cox offset. ``'yeojohnson'`` uses Yeo-Johnson for every
+        value and supports negatives.
     anova_alpha : float, default=0.05
         Significance level used for both the location gate
         (``scipy.stats.f_oneway``) and the scale gate
@@ -137,6 +144,14 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         Per-marker-column p-value from ``scipy.stats.levene`` (center=
         ``'median'``) over ``z_base`` across categorical groups (scale
         gate). Same ``np.nan`` conditions as ``_anova_pvalues_``.
+    zero_counts_ : dict of int -> int
+        Number of exact zeros observed for each marker during fitting.
+    zero_fractions_ : dict of int -> float
+        Training prevalence ``p0`` of exact zeros for each marker.
+    zero_zscores_ : dict of int -> float
+        Score assigned to zeros by percentile handling,
+        ``norm.ppf(p0 / 2)``. ``np.nan`` when no zero was observed or another
+        zero strategy is active.
 
     Notes
     -----
@@ -182,7 +197,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         n_iterations: int = 3,
         log_transform_continuous: bool = False,
         bin_size: int = 120,
-        zero_handles: str = "eps",
+        zero_handles: str = "percentile",
         anova_alpha: float = 0.05,
         anchor_strategy: str = "farthest_point",
         transform_continuous: Optional[str] = None,
@@ -279,8 +294,9 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         ----------
         X : array-like of shape (n_samples, n_markers) or (n_samples,)
             Marker/target matrix. Every column is treated as a target to
-            normalize. Values must be strictly positive (required by Box-Cox)
-            unless ``zero_handles='yeojohnson'`` is set.
+            normalize. With ``zero_handles='percentile'``, zeros are excluded
+            from fitting and at least two positive values per marker are
+            required. Negative values require ``zero_handles='yeojohnson'``.
         y : ignored
             Not used. Present for scikit-learn pipeline compatibility.
 
@@ -295,8 +311,12 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         validate_data(self, X, reset=True)
         n_samples = X.shape[0]
 
-        if self.zero_handles.lower() not in ("eps", "yeojohnson"):
-            raise ValueError("zero_handles must be 'eps' or 'yeojohnson'.")
+        zero_handles = self.zero_handles.lower()
+        if zero_handles not in _ZERO_HANDLES:
+            raise ValueError(
+                f"zero_handles must be one of {_ZERO_HANDLES}; "
+                f"got {self.zero_handles!r}."
+            )
 
         resolved_transform = _resolve_continuous_transform(
             self.transform_continuous, self.log_transform_continuous
@@ -329,9 +349,33 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         self._cat_corrections = {}
         self._anova_pvalues_: Dict[int, float] = {}
         self._levene_pvalues_: Dict[int, float] = {}
+        self.zero_counts_: Dict[int, int] = {}
+        self.zero_fractions_: Dict[int, float] = {}
+        self.zero_zscores_: Dict[int, float] = {}
 
         for col in range(X.shape[1]):
             y_all = X[:, col]
+            zero_mask = y_all == 0.0
+            zero_count = int(np.count_nonzero(zero_mask))
+            zero_fraction = zero_count / n_samples
+            self.zero_counts_[col] = zero_count
+            self.zero_fractions_[col] = zero_fraction
+
+            if zero_handles == "percentile" and zero_count:
+                zero_zscore = float(norm.ppf(zero_fraction / 2.0))
+                logger.info(
+                    "Marker column %d: excluding %d/%d zero values (%.4f%%) "
+                    "from lambda, surface, and categorical-correction fitting; "
+                    "transform score=%.6f from Phi^-1(p0/2).",
+                    col,
+                    zero_count,
+                    n_samples,
+                    100.0 * zero_fraction,
+                    zero_zscore,
+                )
+            else:
+                zero_zscore = np.nan
+            self.zero_zscores_[col] = zero_zscore
 
             fitter = ContinuousSurfaceFitter(
                 n_bins=self.n_bins,
@@ -346,10 +390,21 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             )
             fitter.fit(cont_data, y_all)
             self._fitters[col] = fitter
-            y_bc_all = fitter._transform(y_all, fitter.lambda_)
 
-            mu_all, sigma_all = fitter.predict_mu_sigma(cont_data)
-            z_base_all = (y_bc_all - mu_all) / np.maximum(sigma_all, 1e-6)
+            correction_mask = (
+                ~zero_mask
+                if zero_handles == "percentile"
+                else np.ones(n_samples, dtype=bool)
+            )
+            y_for_correction = y_all[correction_mask]
+            cont_for_correction = cont_data[correction_mask]
+            y_bc_for_correction = fitter._transform(y_for_correction, fitter.lambda_)
+
+            mu_fit, sigma_fit = fitter.predict_mu_sigma(cont_for_correction)
+            z_base_all = np.full(n_samples, np.nan, dtype=float)
+            z_base_all[correction_mask] = (y_bc_for_correction - mu_fit) / np.maximum(
+                sigma_fit, 1e-6
+            )
 
             col_corrections: Dict[Tuple, Tuple[float, float]] = {}
             if cat_data.shape[1] == 0:
@@ -358,7 +413,10 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
                 col_corrections[tuple()] = (0.0, 1.0)
             else:
                 n_groups = len(unique_rows)
-                groups_z = [z_base_all[inverse_indices == i] for i in range(n_groups)]
+                groups_z = [
+                    z_base_all[(inverse_indices == i) & correction_mask]
+                    for i in range(n_groups)
+                ]
                 valid_groups = [g for g in groups_z if len(g) >= 2]
 
                 apply_mu = False
@@ -382,6 +440,9 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
                 for i in range(n_groups):
                     cat_tuple = tuple(unique_rows[i])
                     z_group = groups_z[i]
+                    if len(z_group) == 0:
+                        col_corrections[cat_tuple] = (0.0, 1.0)
+                        continue
                     mu_cat = float(np.median(z_group)) if apply_mu else 0.0
                     sigma_cat = (
                         max(_robust_scale(z_group), 1e-6) if apply_sigma else 1.0
@@ -408,8 +469,9 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         ----------
         X : array-like of shape (n_samples, n_markers) or (n_samples,)
             Marker matrix with the same number of columns as used in
-            :meth:`fit`. Values must be strictly positive (required by
-            Box-Cox) unless ``zero_handles='yeojohnson'`` is set.
+            :meth:`fit`. With ``zero_handles='percentile'``, zeros receive a
+            finite score learned from their training prevalence. Negative
+            values require ``zero_handles='yeojohnson'``.
         categorical_vals : ArrayLike, optional
             Override the categorical covariate values stored at construction.
             Must have the same number of rows as ``X`` and the same number of
@@ -465,16 +527,41 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             cat_groups = [(tuple(), np.arange(n_samples))]
 
         X_out = X.copy()
+        zero_handles = self.zero_handles.lower()
 
         for col in range(X.shape[1]):
-            y_raw = X_out[:, col]
+            y_raw = X[:, col]
             fitter = self._fitters[col]
-            y_bc = fitter._transform(y_raw, fitter.lambda_)
-
-            mu_pred, sigma_pred = fitter.predict_mu_sigma(cont_data)
-            z_base = (y_bc - mu_pred) / np.maximum(sigma_pred, 1e-6)
+            zero_mask = y_raw == 0.0
+            if zero_handles == "percentile":
+                if np.any(y_raw < 0.0):
+                    raise ValueError(
+                        "zero_handles='percentile' does not support negative "
+                        f"values in marker column {col}; use 'yeojohnson'."
+                    )
+                if np.any(zero_mask) and self.zero_counts_[col] == 0:
+                    raise ValueError(
+                        f"Marker column {col} contains zeros at transform time, "
+                        "but no zeros were observed during fit; p0/2 is undefined."
+                    )
+                positive_mask = ~zero_mask
+                z_base = np.zeros(n_samples, dtype=float)
+                if np.any(positive_mask):
+                    y_bc = fitter._transform(y_raw[positive_mask], fitter.lambda_)
+                    mu_pred, sigma_pred = fitter.predict_mu_sigma(
+                        cont_data[positive_mask]
+                    )
+                    z_base[positive_mask] = (y_bc - mu_pred) / np.maximum(
+                        sigma_pred, 1e-6
+                    )
+            else:
+                positive_mask = np.ones(n_samples, dtype=bool)
+                y_bc = fitter._transform(y_raw, fitter.lambda_)
+                mu_pred, sigma_pred = fitter.predict_mu_sigma(cont_data)
+                z_base = (y_bc - mu_pred) / np.maximum(sigma_pred, 1e-6)
 
             col_corrections = self._cat_corrections[col]
+            unseen_mask = np.zeros(n_samples, dtype=bool)
             for cat_tuple, row_indices in cat_groups:
                 if cat_tuple not in col_corrections:
                     warnings.warn(
@@ -482,9 +569,22 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
                         "Setting Z-scores to 0."
                     )
                     X_out[row_indices, col] = 0.0
+                    unseen_mask[row_indices] = True
                     continue
                 mu_cat, sigma_cat = col_corrections[cat_tuple]
                 X_out[row_indices, col] = (z_base[row_indices] - mu_cat) / sigma_cat
+
+            if zero_handles == "percentile":
+                p0 = self.zero_fractions_[col]
+                positive_to_map = positive_mask & ~unseen_mask
+                if p0 > 0.0 and np.any(positive_to_map):
+                    probabilities = p0 + (1.0 - p0) * norm.cdf(
+                        X_out[positive_to_map, col]
+                    )
+                    probabilities = np.minimum(probabilities, np.nextafter(1.0, 0.0))
+                    X_out[positive_to_map, col] = norm.ppf(probabilities)
+                if np.any(zero_mask):
+                    X_out[zero_mask, col] = self.zero_zscores_[col]
 
         return X_out
 

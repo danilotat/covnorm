@@ -6,7 +6,11 @@ A single polynomial curve is fitted over mu and sigma across the entire dataset 
 
 After fitting the shared surface, a post-hoc categorical correction is applied: the mean and standard deviation of the base Z-scores are computed within each categorical group and used to rescale final Z-scores, giving `Z_corrected = (Z_base - mu_cat) / sigma_cat`. This avoids overfitting independent surfaces to small groups.
 
-> **Data requirement:** target values must be strictly positive for Box-Cox (default). If your data contains zeros, set `zero_handles="eps"` (adds a small epsilon before Box-Cox) or `zero_handles="yeojohnson"` (switches to Yeo-Johnson transform). Negative values are not supported.
+> **Data requirement:** with the default `zero_handles="percentile"`, Box-Cox
+> lambda and the conditional surfaces are fitted only on strictly positive
+> target values. Exact zeros are retained in the output through the
+> training-derived percentile handling described below. Negative targets
+> require `zero_handles="yeojohnson"`.
 
 Supports up to 2 categorical covariates and up to 2 continuous covariates. With 2 continuous covariates, k-NN overlapping windows replace the 1D rolling windows; set `n_bins >= 10` in that case.
 
@@ -71,7 +75,7 @@ marker_new_norm = normalizer.transform(
 | `n_iterations` | `3` | Maximum iterative conditional outlier-removal passes |
 | `transform_continuous` | `None` | Continuous-covariate transform: `None` keeps the original values, `"log10"` applies a base-10 logarithm, and `"zscore"` subtracts the training mean and divides by the population standard deviation. Fitted parameters are reused at inference. |
 | `log_transform_continuous` | `False` | Deprecated alias for `transform_continuous="log10"`. Emits `FutureWarning`, cannot be combined with `"zscore"`, and will be removed in version 1.x. |
-| `zero_handles` | `"eps"` | Strategy for zero values in the target: `"eps"` adds a small epsilon before Box-Cox; `"yeojohnson"` switches to Yeo-Johnson transform (supports zeros and negatives) |
+| `zero_handles` | `"percentile"` | Zero strategy: `"percentile"` excludes zeros from Box-Cox/surface fitting and maps their observed mass at transform time; `"eps"` retains the legacy `1e-6` offset; `"yeojohnson"` uses Yeo-Johnson for all values and supports zeros and negatives. |
 
 `transform_continuous` acts on the continuous covariates, whereas Box-Cox or
 Yeo-Johnson acts on each marker. The two transformations serve different
@@ -93,6 +97,35 @@ Before fitting, polynomial feature columns are standardized and both the
 location and log-scale surfaces use Ridge regression. With `B` valid bins, the
 effective objective is `mean_squared_error + ridge_alpha * ||coef||²`; the
 intercept is not penalized.
+
+### Zero-percentile handling
+
+For each marker, the default strategy records the training prevalence of exact
+zeros, `p0`, and logs their count at `INFO` level. Zeros do not participate in
+lambda selection, rolling/k-NN window estimates, polynomial surface fitting, or
+post-hoc categorical corrections. At least two positive training values are
+required per marker.
+
+At transform time, exact zeros are treated as the lowest tied probability mass
+and receive its midpoint normal score:
+
+```text
+z_zero = normal_ppf(p0 / 2)
+```
+
+Positive conditional Z-scores are placed above the zero mass:
+
+```text
+u_positive = p0 + (1 - p0) * normal_cdf(z_positive)
+z_final    = normal_ppf(u_positive)
+```
+
+Here `normal_cdf` and `normal_ppf` are respectively `scipy.stats.norm.cdf` and
+`scipy.stats.norm.ppf`. The learned values are exposed in `zero_counts_`,
+`zero_fractions_`, and `zero_zscores_`, keyed by marker-column index, and are
+reused unchanged for new batches. If a marker had no zero during fitting but
+receives one during transform, the transformer raises `ValueError` because its
+training prevalence is undefined.
 
 ## Worm-plot diagnostics
 
