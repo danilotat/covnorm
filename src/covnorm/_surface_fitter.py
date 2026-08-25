@@ -6,9 +6,9 @@ from typing import List, Optional, Tuple
 import numpy as np
 import scipy.stats as stats
 from scipy.stats import boxcox, yeojohnson
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import Ridge
 from sklearn.neighbors import KDTree
-from sklearn.preprocessing import PolynomialFeatures
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 
 _ANCHOR_STRATEGIES = ("farthest_point", "projection_rank")
 _CONTINUOUS_TRANSFORMS = (None, "log10", "zscore")
@@ -88,6 +88,10 @@ class ContinuousSurfaceFitter:
     degree : int, default=3
         Degree of the polynomial curve fitted to the window estimates.
         Mørkved et al. (2015) use cubic polynomials.
+    ridge_alpha : float, default=0.05
+        L2 penalty relative to the mean squared fitting loss for both the mu and
+        log-sigma surfaces. The value passed to scikit-learn is
+        ``ridge_alpha * n_valid_bins``. Set to ``0.0`` to disable regularization.
     lambda_ : float or None, default=None
         Box-Cox transformation (or Jeo-Yohnson) parameter. When ``None`` the
         optimal value is found via a grid search over [-2, 2] that maximises the Pearson correlation between sorted BoxCox(y) values and their theoretical
@@ -145,10 +149,13 @@ class ContinuousSurfaceFitter:
     ----------
     poly_transformer : sklearn.preprocessing.PolynomialFeatures
         Transforms covariate vectors into polynomial feature matrices.
-    mu_model : sklearn.linear_model.LinearRegression
-        Linear model predicting mu (in Box-Cox space) from polynomial features.
-    sigma_model : sklearn.linear_model.LinearRegression
-        Linear model predicting log-sigma from polynomial features. Predictions
+    poly_scaler : sklearn.preprocessing.StandardScaler
+        Standardizes polynomial feature columns before Ridge fitting, making the
+        penalty independent of the covariates' units and polynomial powers.
+    mu_model : sklearn.linear_model.Ridge
+        Ridge model predicting mu (in Box-Cox space) from polynomial features.
+    sigma_model : sklearn.linear_model.Ridge
+        Ridge model predicting log-sigma from polynomial features. Predictions
         are exponentiated back to sigma in Box-Cox space.
     lambda_ : float
         Box-Cox (or Jeo-Yohnson) parameter; ``None`` until :meth:`fit` is called.
@@ -208,9 +215,11 @@ class ContinuousSurfaceFitter:
         zero_handles: str = "eps",
         anchor_strategy: str = "farthest_point",
         transform_continuous: Optional[str] = None,
+        ridge_alpha: float = 0.05,
     ):
         self.n_bins = n_bins
         self.degree = degree
+        self.ridge_alpha = ridge_alpha
         self.lambda_ = lambda_
         self.n_iterations = n_iterations
         self.log_transform_continuous = log_transform_continuous
@@ -218,8 +227,9 @@ class ContinuousSurfaceFitter:
         self.poly_transformer = PolynomialFeatures(
             degree=self.degree, include_bias=True
         )
-        self.mu_model = LinearRegression(fit_intercept=False)
-        self.sigma_model = LinearRegression(fit_intercept=False)
+        self.poly_scaler = StandardScaler()
+        self.mu_model = Ridge(alpha=self.ridge_alpha, fit_intercept=True)
+        self.sigma_model = Ridge(alpha=self.ridge_alpha, fit_intercept=True)
         self._global_mu: float = 0.0
         self._global_sigma: float = 1.0
         self._is_fitted: bool = False
@@ -266,6 +276,15 @@ class ContinuousSurfaceFitter:
             raise ValueError(
                 f"anchor_strategy must be one of {_ANCHOR_STRATEGIES}; "
                 f"got {self.anchor_strategy!r}."
+            )
+        if (
+            not isinstance(self.ridge_alpha, (int, float, np.number))
+            or not np.isfinite(self.ridge_alpha)
+            or self.ridge_alpha < 0.0
+        ):
+            raise ValueError(
+                f"ridge_alpha must be a finite non-negative number; "
+                f"got {self.ridge_alpha!r}."
             )
 
         _, n_features = X_cont.shape
@@ -316,11 +335,15 @@ class ContinuousSurfaceFitter:
                 return self
 
             X_poly = self.poly_transformer.fit_transform(np.array(valid_centers))
-            self.mu_model.fit(X_poly, mu_estimates)
+            X_poly_scaled = self.poly_scaler.fit_transform(X_poly)
+            effective_alpha = float(self.ridge_alpha) * len(valid_centers)
+            self.mu_model.set_params(alpha=effective_alpha)
+            self.sigma_model.set_params(alpha=effective_alpha)
+            self.mu_model.fit(X_poly_scaled, mu_estimates)
             log_sigma_estimates = np.log(
                 np.maximum(np.asarray(sigma_estimates), _SIGMA_FLOOR)
             )
-            self.sigma_model.fit(X_poly, log_sigma_estimates)
+            self.sigma_model.fit(X_poly_scaled, log_sigma_estimates)
             self._log_sigma_bounds_ = (
                 float(np.min(log_sigma_estimates)),
                 float(np.max(log_sigma_estimates)),
@@ -331,8 +354,9 @@ class ContinuousSurfaceFitter:
             self.bin_sigma_ = np.array(sigma_estimates)
 
             X_poly_work = self.poly_transformer.transform(X_work)
-            mu_pred = self.mu_model.predict(X_poly_work)
-            sigma_pred = self._predict_sigma_from_poly(X_poly_work)
+            X_poly_work_scaled = self.poly_scaler.transform(X_poly_work)
+            mu_pred = self.mu_model.predict(X_poly_work_scaled)
+            sigma_pred = self._predict_sigma_from_poly(X_poly_work_scaled)
             y_bc = self._transform(y_work, self.lambda_)
 
             z = (y_bc - mu_pred) / sigma_pred
@@ -385,8 +409,9 @@ class ContinuousSurfaceFitter:
             )
         X_cont = self._transform_continuous_covariates(X_cont, fit=False)
         X_poly = self.poly_transformer.transform(X_cont)
-        mu = self.mu_model.predict(X_poly)
-        sigma = self._predict_sigma_from_poly(X_poly)
+        X_poly_scaled = self.poly_scaler.transform(X_poly)
+        mu = self.mu_model.predict(X_poly_scaled)
+        sigma = self._predict_sigma_from_poly(X_poly_scaled)
 
         invalid = ~np.isfinite(sigma) | (sigma <= 0.0) | ~np.isfinite(mu)
         if invalid.any():

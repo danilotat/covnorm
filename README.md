@@ -67,6 +67,7 @@ marker_new_norm = normalizer.transform(
 | `n_bins` | `6` | Target number of rolling windows (controls stride) |
 | `bin_size` | `120` | Samples per rolling window (Mørkved et al. use 120) |
 | `degree` | `3` | Polynomial degree of the mu/sigma curve |
+| `ridge_alpha` | `0.05` | L2 penalty relative to mean squared fitting loss. Internally multiplied by the number of valid bins; set to `0.0` to disable regularization. |
 | `n_iterations` | `3` | Maximum iterative conditional outlier-removal passes |
 | `transform_continuous` | `None` | Continuous-covariate transform: `None` keeps the original values, `"log10"` applies a base-10 logarithm, and `"zscore"` subtracts the training mean and divides by the population standard deviation. Fitted parameters are reused at inference. |
 | `log_transform_continuous` | `False` | Backward-compatible alias for `transform_continuous="log10"`. Cannot be combined with `transform_continuous="zscore"`. |
@@ -74,8 +75,8 @@ marker_new_norm = normalizer.transform(
 
 `transform_continuous` acts on the continuous covariates, whereas Box-Cox or
 Yeo-Johnson acts on each marker. The two transformations serve different
-purposes. `"zscore"` improves the numerical conditioning of polynomial
-features without changing the polynomial function class. `"log10"` is a
+purposes. `"zscore"` makes the covariate coordinates invariant to affine unit
+changes without changing the polynomial function class. `"log10"` is a
 non-linear modelling choice and requires all continuous covariates to be
 strictly positive.
 
@@ -87,6 +88,11 @@ predicted log-scale is constrained to the range estimated in the final fitting
 windows (whose lower bound is itself floored at `log(1e-6)`). This prevents
 unsupported polynomial oscillations from becoming near-zero or enormous
 scales.
+
+Before fitting, polynomial feature columns are standardized and both the
+location and log-scale surfaces use Ridge regression. With `B` valid bins, the
+effective objective is `mean_squared_error + ridge_alpha * ||coef||²`; the
+intercept is not penalized.
 
 ## Plotting
 

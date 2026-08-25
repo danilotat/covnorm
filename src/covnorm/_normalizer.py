@@ -76,6 +76,10 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
     degree : int, default=3
         Degree of the polynomial curve fitted over the window mu/sigma
         estimates. Mørkved et al. (2015) use cubic polynomials.
+    ridge_alpha : float, default=0.05
+        L2 penalty relative to the mean squared fitting loss for both polynomial
+        surfaces. The effective scikit-learn penalty is
+        ``ridge_alpha * n_valid_bins``. Set to ``0.0`` to disable regularization.
     n_iterations : int, default=3
         Maximum number of iterative conditional outlier-removal passes applied
         before the polynomial is finalised.
@@ -180,11 +184,13 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         anova_alpha: float = 0.05,
         anchor_strategy: str = "farthest_point",
         transform_continuous: Optional[str] = None,
+        ridge_alpha: float = 0.05,
     ):
         self.categorical_vals = categorical_vals
         self.continuous_vals = continuous_vals
         self.n_bins = n_bins
         self.degree = degree
+        self.ridge_alpha = ridge_alpha
         self.n_iterations = n_iterations
         self.log_transform_continuous = log_transform_continuous
         self.bin_size = bin_size
@@ -249,6 +255,15 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             )
         if not (0.0 <= self.anova_alpha <= 1.0):
             raise ValueError(f"anova_alpha must be in [0, 1]; got {self.anova_alpha}.")
+        if (
+            not isinstance(self.ridge_alpha, (int, float, np.number))
+            or not np.isfinite(self.ridge_alpha)
+            or self.ridge_alpha < 0.0
+        ):
+            raise ValueError(
+                f"ridge_alpha must be a finite non-negative number; "
+                f"got {self.ridge_alpha!r}."
+            )
         _resolve_continuous_transform(
             self.transform_continuous, self.log_transform_continuous
         )
@@ -313,6 +328,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             fitter = ContinuousSurfaceFitter(
                 n_bins=self.n_bins,
                 degree=self.degree,
+                ridge_alpha=self.ridge_alpha,
                 n_iterations=self.n_iterations,
                 log_transform_continuous=self.log_transform_continuous,
                 bin_size=self.bin_size,
