@@ -16,10 +16,20 @@ _SIGMA_FLOOR = 1e-6
 _LOG_SIGMA_FLOOR = float(np.log(_SIGMA_FLOOR))
 
 
+def _warn_log_transform_continuous_deprecated() -> None:
+    warnings.warn(
+        "log_transform_continuous is deprecated and will be removed in covnorm "
+        "1.x; use transform_continuous='log10' instead.",
+        FutureWarning,
+        stacklevel=3,
+    )
+
+
 def _resolve_continuous_transform(
     transform_continuous: Optional[str], log_transform_continuous: bool
 ) -> Optional[str]:
     """Resolve the new transform option and its legacy boolean alias."""
+    # TODO(v1.x): remove log_transform_continuous and this legacy resolution path.
     if transform_continuous not in _CONTINUOUS_TRANSFORMS:
         raise ValueError(
             "transform_continuous must be one of None, 'log10', or 'zscore'; "
@@ -103,7 +113,8 @@ class ContinuousSurfaceFitter:
         conditional Z-score exceeds 3.372 in absolute value.
     log_transform_continuous : bool, default=False
         Legacy alias for ``transform_continuous='log10'``. Retained for
-        backward compatibility. It cannot be combined with
+        backward compatibility and scheduled for removal in version 1.x. Using
+        it emits ``FutureWarning``. It cannot be combined with
         ``transform_continuous='zscore'``.
     bin_size : int, default=120
         Number of samples per rolling window. Mørkved et al. (2015) use 120.
@@ -286,6 +297,11 @@ class ContinuousSurfaceFitter:
                 f"ridge_alpha must be a finite non-negative number; "
                 f"got {self.ridge_alpha!r}."
             )
+        _resolve_continuous_transform(
+            self.transform_continuous, self.log_transform_continuous
+        )
+        if self.log_transform_continuous:
+            _warn_log_transform_continuous_deprecated()
 
         _, n_features = X_cont.shape
         X_cont = self._transform_continuous_covariates(X_cont, fit=True)

@@ -9,6 +9,7 @@ from covnorm._surface_fitter import (
     ContinuousSurfaceFitter,
     RobustNormalizerConfig,
     _resolve_continuous_transform,
+    _warn_log_transform_continuous_deprecated,
 )
 
 
@@ -85,7 +86,8 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         before the polynomial is finalised.
     log_transform_continuous : bool, default=False
         Legacy alias for ``transform_continuous='log10'``. Retained for
-        backward compatibility and incompatible with
+        backward compatibility and scheduled for removal in version 1.x. Using
+        it emits ``FutureWarning``. It is incompatible with
         ``transform_continuous='zscore'``.
     bin_size : int, default=120
         Number of samples per rolling window. Mørkved et al. (2015) use 120.
@@ -296,6 +298,12 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         if self.zero_handles.lower() not in ("eps", "yeojohnson"):
             raise ValueError("zero_handles must be 'eps' or 'yeojohnson'.")
 
+        resolved_transform = _resolve_continuous_transform(
+            self.transform_continuous, self.log_transform_continuous
+        )
+        if self.log_transform_continuous:
+            _warn_log_transform_continuous_deprecated()
+
         cat_raw = self._coerce_covariates(self.categorical_vals, n_samples)
         cont_data = self._coerce_covariates(self.continuous_vals, n_samples)
 
@@ -330,11 +338,11 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
                 degree=self.degree,
                 ridge_alpha=self.ridge_alpha,
                 n_iterations=self.n_iterations,
-                log_transform_continuous=self.log_transform_continuous,
+                log_transform_continuous=False,
                 bin_size=self.bin_size,
                 zero_handles=self.zero_handles,
                 anchor_strategy=self.anchor_strategy,
-                transform_continuous=self.transform_continuous,
+                transform_continuous=resolved_transform,
             )
             fitter.fit(cont_data, y_all)
             self._fitters[col] = fitter

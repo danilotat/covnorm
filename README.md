@@ -70,7 +70,7 @@ marker_new_norm = normalizer.transform(
 | `ridge_alpha` | `0.05` | L2 penalty relative to mean squared fitting loss. Internally multiplied by the number of valid bins; set to `0.0` to disable regularization. |
 | `n_iterations` | `3` | Maximum iterative conditional outlier-removal passes |
 | `transform_continuous` | `None` | Continuous-covariate transform: `None` keeps the original values, `"log10"` applies a base-10 logarithm, and `"zscore"` subtracts the training mean and divides by the population standard deviation. Fitted parameters are reused at inference. |
-| `log_transform_continuous` | `False` | Backward-compatible alias for `transform_continuous="log10"`. Cannot be combined with `transform_continuous="zscore"`. |
+| `log_transform_continuous` | `False` | Deprecated alias for `transform_continuous="log10"`. Emits `FutureWarning`, cannot be combined with `"zscore"`, and will be removed in version 1.x. |
 | `zero_handles` | `"eps"` | Strategy for zero values in the target: `"eps"` adds a small epsilon before Box-Cox; `"yeojohnson"` switches to Yeo-Johnson transform (supports zeros and negatives) |
 
 `transform_continuous` acts on the continuous covariates, whereas Box-Cox or

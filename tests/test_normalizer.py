@@ -621,18 +621,50 @@ def test_transform_continuous_log10_matches_legacy_boolean():
     y = rng.gamma(3.0, 2.0, 400)
     kwargs = dict(n_bins=8, degree=2, lambda_=0.2, n_iterations=1)
 
-    legacy = ContinuousSurfaceFitter(**kwargs, log_transform_continuous=True).fit(
-        X_cont, y
-    )
-    current = ContinuousSurfaceFitter(**kwargs, transform_continuous="log10").fit(
-        X_cont, y
-    )
+    with pytest.warns(FutureWarning, match="removed in covnorm 1.x") as caught:
+        legacy = ContinuousSurfaceFitter(**kwargs, log_transform_continuous=True).fit(
+            X_cont, y
+        )
+    assert len(caught) == 1
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        current = ContinuousSurfaceFitter(**kwargs, transform_continuous="log10").fit(
+            X_cont, y
+        )
 
     np.testing.assert_allclose(legacy.bin_centers_, current.bin_centers_)
     mu_legacy, sigma_legacy = legacy.predict_mu_sigma(X_cont)
     mu_current, sigma_current = current.predict_mu_sigma(X_cont)
     np.testing.assert_allclose(mu_legacy, mu_current)
     np.testing.assert_allclose(sigma_legacy, sigma_current)
+
+
+def test_normalizer_warns_once_for_legacy_log_alias_across_multiple_markers():
+    rng = np.random.default_rng(790)
+    n = 400
+    cont = rng.uniform(1.0, 1000.0, (n, 1))
+    markers = rng.gamma(3.0, 2.0, (n, 2))
+    normalizer = RobustConditionalNormalizer(
+        categorical_vals=np.empty((n, 0)),
+        continuous_vals=cont,
+        n_bins=8,
+        degree=2,
+        n_iterations=1,
+        log_transform_continuous=True,
+    )
+
+    with pytest.warns(FutureWarning, match="removed in covnorm 1.x") as caught:
+        normalizer.fit(markers)
+
+    assert len(caught) == 1
+    assert all(
+        fitter._resolved_transform_continuous_ == "log10"
+        for fitter in normalizer._fitters.values()
+    )
+    assert all(
+        not fitter.log_transform_continuous for fitter in normalizer._fitters.values()
+    )
 
 
 def test_transform_continuous_validation_and_legacy_conflict():
