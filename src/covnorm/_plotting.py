@@ -70,7 +70,8 @@ def plot_worm(
     marker_label : str, optional
         Label used in the figure title. Defaults to ``"marker {marker_col}"``.
     figsize : tuple of (float, float), optional
-        Figure size. By default it is derived from the panel layout.
+        Figure size. By default it is derived from the panel layout using
+        ``3.6`` by ``2.8`` inches per panel.
 
     Returns
     -------
@@ -161,7 +162,7 @@ def plot_worm(
     n_cols = min(3, n_panels)
     n_rows = ceil(n_panels / n_cols)
     if figsize is None:
-        figsize = (4.0 * n_cols, 3.2 * n_rows)
+        figsize = (3.6 * n_cols, 2.8 * n_rows)
     fig, axes = plt.subplots(
         n_rows,
         n_cols,
@@ -228,11 +229,24 @@ def plot_worm(
     for ax in flat_axes[n_panels:]:
         fig.delaxes(ax)
 
+    fig_width, fig_height = fig.get_size_inches()
+    layout_left = min(0.18, 0.55 / fig_width)
+    layout_bottom = min(0.20, 0.42 / fig_height)
+    layout_right = 1.0 - min(0.03, 0.10 / fig_width)
+    layout_top = max(0.60, 1.0 - 0.42 / fig_height)
+
     name = marker_label if marker_label is not None else f"marker {marker_col}"
-    fig.suptitle(f"Worm plot — {name}")
-    fig.supxlabel("Theoretical normal quantile")
-    fig.supylabel("Observed − theoretical quantile")
-    fig.tight_layout()
+    suptitle = fig.suptitle(f"Worm plot — {name}", y=1.0 - min(0.12, 0.10 / fig_height))
+    supxlabel = fig.supxlabel(
+        "Theoretical normal quantile", y=min(0.08, 0.11 / fig_height)
+    )
+    supylabel = fig.supylabel(
+        "Observed − theoretical quantile", x=min(0.08, 0.11 / fig_width)
+    )
+    suptitle.set_in_layout(False)
+    supxlabel.set_in_layout(False)
+    supylabel.set_in_layout(False)
+    fig.tight_layout(rect=(layout_left, layout_bottom, layout_right, layout_top))
     return fig
 
 

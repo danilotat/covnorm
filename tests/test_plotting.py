@@ -42,6 +42,15 @@ def test_plot_worm_draws_equal_count_conditional_panels():
     assert len(fig.axes) == 4
     assert all("age:" in ax.get_title() for ax in fig.axes)
     assert fig._suptitle.get_text() == "Worm plot — CD4"
+    np.testing.assert_allclose(fig.get_size_inches(), [10.8, 5.6])
+
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    suptitle_bottom = fig._suptitle.get_window_extent(renderer).y0
+    first_row_title_top = max(
+        ax.title.get_window_extent(renderer).y1 for ax in fig.axes
+    )
+    assert suptitle_bottom - first_row_title_top >= 10.0
 
     z_scores = normalizer.transform(marker)[:, 0]
     first_group = np.array_split(np.argsort(age[:, 0], kind="mergesort"), 4)[0]
