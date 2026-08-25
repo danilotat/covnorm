@@ -14,6 +14,7 @@ _ANCHOR_STRATEGIES = ("farthest_point", "projection_rank")
 _CONTINUOUS_TRANSFORMS = (None, "log10", "zscore")
 _SIGMA_FLOOR = 1e-6
 _LOG_SIGMA_FLOOR = float(np.log(_SIGMA_FLOOR))
+_ZSCORE_OUTLIER_THRESHOLD = 3.372
 
 
 def _warn_log_transform_continuous_deprecated() -> None:
@@ -376,7 +377,7 @@ class ContinuousSurfaceFitter:
             y_bc = self._transform(y_work, self.lambda_)
 
             z = (y_bc - mu_pred) / sigma_pred
-            mask = np.abs(z) <= 3.372
+            mask = np.abs(z) <= _ZSCORE_OUTLIER_THRESHOLD
 
             if mask.all():
                 break

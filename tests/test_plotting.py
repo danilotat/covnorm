@@ -9,6 +9,7 @@ from matplotlib.collections import PathCollection
 from scipy import stats
 
 from covnorm import RobustConditionalNormalizer, plot_worm
+from covnorm._plotting import _worm_statistics
 
 
 def _fit_one_covariate_normalizer(n: int = 240):
@@ -41,6 +42,15 @@ def test_plot_worm_draws_equal_count_conditional_panels():
     assert len(fig.axes) == 4
     assert all("age:" in ax.get_title() for ax in fig.axes)
     assert fig._suptitle.get_text() == "Worm plot — CD4"
+    np.testing.assert_allclose(fig.get_size_inches(), [10.8, 5.6])
+
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    suptitle_bottom = fig._suptitle.get_window_extent(renderer).y0
+    first_row_title_top = max(
+        ax.title.get_window_extent(renderer).y1 for ax in fig.axes
+    )
+    assert suptitle_bottom - first_row_title_top >= 10.0
 
     z_scores = normalizer.transform(marker)[:, 0]
     first_group = np.array_split(np.argsort(age[:, 0], kind="mergesort"), 4)[0]
@@ -56,6 +66,12 @@ def test_plot_worm_draws_equal_count_conditional_panels():
         if isinstance(collection, PathCollection)
     )
     np.testing.assert_allclose(points.get_offsets(), expected)
+
+    summary = fig.axes[0].texts[0].get_text()
+    assert "median=" in summary
+    assert "MADσ=" in summary
+    assert "tail−=" in summary
+    assert "tail+=" in summary
     plt.close(fig)
 
 
@@ -125,6 +141,17 @@ def test_plot_worm_can_condition_on_second_continuous_covariate():
     assert len(fig.axes) == 4
     assert all("BMI:" in ax.get_title() for ax in fig.axes)
     plt.close(fig)
+
+
+def test_worm_statistics_report_robust_scale_and_both_tails():
+    residuals = np.array([-4.0, -1.0, 0.0, 1.0, 5.0])
+
+    median, mad_scale, lower_tail, upper_tail = _worm_statistics(residuals)
+
+    assert median == 0.0
+    assert mad_scale == pytest.approx(1.0 / stats.norm.ppf(0.75))
+    assert lower_tail == pytest.approx(0.2)
+    assert upper_tail == pytest.approx(0.2)
 
 
 @pytest.mark.parametrize(

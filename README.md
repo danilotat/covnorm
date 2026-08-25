@@ -115,6 +115,11 @@ non-overlapping bins of the selected covariate. A well-calibrated normalizer
 produces approximately flat worms around zero inside the pointwise reference
 bands.
 
+Each panel also reports four local calibration summaries computed from the same
+Z-scores as the worm: the median (target `0`), a normal-consistent MAD scale
+(target `1`), and the percentages in the lower and upper tails beyond
+`-3.372` and `+3.372` (about `0.04%` each under a standard normal).
+
 Offsets indicate conditional location bias, slopes indicate scale bias, and
 curved patterns can reveal residual skewness or tail-weight mismatch. When two
 continuous covariates are present, use `covariate_index=0` or `1` to choose the
