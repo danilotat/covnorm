@@ -18,6 +18,7 @@ import warnings
 import numpy as np
 import pytest
 from sklearn.base import clone
+from sklearn.linear_model import LinearRegression
 from sklearn.pipeline import Pipeline
 
 from covnorm import ContinuousSurfaceFitter, RobustConditionalNormalizer
@@ -441,6 +442,53 @@ def test_surface_fitter_sigma_strictly_positive(rng=RNG):
     assert np.all(sigma > 0)
 
 
+def test_surface_fitter_fits_log_sigma_targets(monkeypatch):
+    rng = np.random.default_rng(420)
+    X_cont = rng.uniform(0, 100, (300, 1))
+    y = rng.gamma(2.0, 1.0, 300)
+    fitter = ContinuousSurfaceFitter(n_bins=6, degree=2, lambda_=0.0, n_iterations=1)
+    captured = {}
+    original_fit = LinearRegression.fit
+
+    def capture_sigma_target(model, X, target, *args, **kwargs):
+        if model is fitter.sigma_model:
+            captured["target"] = np.asarray(target).copy()
+        return original_fit(model, X, target, *args, **kwargs)
+
+    monkeypatch.setattr(LinearRegression, "fit", capture_sigma_target)
+    fitter.fit(X_cont, y)
+
+    np.testing.assert_allclose(
+        captured["target"], np.log(np.maximum(fitter.bin_sigma_, 1e-6))
+    )
+
+
+def test_surface_fitter_floors_log_sigma_before_exponentiating():
+    rng = np.random.default_rng(421)
+    X_cont = rng.uniform(1, 100, (300, 1))
+    y = rng.gamma(2.0, 1.0, 300)
+    fitter = ContinuousSurfaceFitter(n_bins=6, degree=2).fit(X_cont, y)
+
+    # With positive polynomial features, these coefficients force log-sigma
+    # below the range supported by every final fitting window.
+    fitter.sigma_model.coef_ = np.full_like(fitter.sigma_model.coef_, -1e6)
+    _, sigma = fitter.predict_mu_sigma(X_cont)
+
+    np.testing.assert_allclose(sigma, np.min(fitter.bin_sigma_))
+
+
+def test_surface_fitter_caps_log_sigma_before_exponentiating():
+    rng = np.random.default_rng(422)
+    X_cont = rng.uniform(1, 100, (300, 1))
+    y = rng.gamma(2.0, 1.0, 300)
+    fitter = ContinuousSurfaceFitter(n_bins=6, degree=2).fit(X_cont, y)
+
+    fitter.sigma_model.coef_ = np.full_like(fitter.sigma_model.coef_, 1e6)
+    _, sigma = fitter.predict_mu_sigma(X_cont)
+
+    np.testing.assert_allclose(sigma, np.max(fitter.bin_sigma_))
+
+
 # ---------------------------------------------------------------------------
 # Continuous-covariate transformations
 # ---------------------------------------------------------------------------
@@ -680,11 +728,13 @@ class TestAnovaGating:
         n = 600
         cat = np.repeat([0.0, 1.0], n // 2).reshape(-1, 1)
         cont = rng.uniform(1, 80, (n, 1))
-        # Large scale ratio creates clear mean and variance differences in z_base
+        # Construct differences that remain in both location and scale after the
+        # marker transformation. A pure Gamma scale-family difference can be
+        # largely removed by Box-Cox and is not a reliable Levene fixture.
         marker = np.concatenate(
             [
-                rng.gamma(2, 5, (n // 2, 1)),
-                rng.gamma(2, 30, (n // 2, 1)),
+                np.exp(rng.normal(0.0, 0.2, (n // 2, 1))),
+                np.exp(rng.normal(1.0, 1.0, (n // 2, 1))),
             ]
         )
 
@@ -999,19 +1049,16 @@ def test_marginal_estimates_are_available_after_a_successful_surface_fit(rng=RNG
     assert fitter.marginal_sigma_ > 0
 
 
-def test_predict_mu_sigma_substitutes_marginal_when_sigma_is_non_positive(rng=RNG):
-    """A polynomial that predicts sigma <= 0 is invalid at that covariate value,
-    not evidence of a vanishing scale. Flooring it at 1e-6 turns "the model does
-    not apply here" into a Z-score of ~1e6; degrade to the marginal fit instead."""
+def test_predict_mu_sigma_substitutes_marginal_when_log_sigma_is_non_finite(rng=RNG):
+    """A non-finite log-scale is unsupported and degrades to the marginal fit."""
     X = rng.uniform(0, 100, (300, 1))
     y = rng.gamma(2.0, 1.0, 300)
     fitter = ContinuousSurfaceFitter(n_bins=6, degree=2)
     fitter.fit(X, y)
 
-    # Force the scale surface negative everywhere (X and its powers are positive).
-    fitter.sigma_model.coef_ = -np.abs(fitter.sigma_model.coef_) - 1.0
+    fitter.sigma_model.coef_ = np.full_like(fitter.sigma_model.coef_, np.nan)
 
-    with pytest.warns(UserWarning, match="non-positive sigma"):
+    with pytest.warns(UserWarning, match="invalid mu or sigma"):
         mu, sigma = fitter.predict_mu_sigma(X)
 
     assert np.all(sigma > 0)

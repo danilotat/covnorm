@@ -79,6 +79,15 @@ features without changing the polynomial function class. `"log10"` is a
 non-linear modelling choice and requires all continuous covariates to be
 strictly positive.
 
+The conditional location surface is fitted directly in transformed-marker
+space. The conditional scale surface is fitted to the logarithm of the
+per-window sigma estimates and exponentiated at prediction time. This keeps
+every finite sigma prediction strictly positive. Before exponentiation, the
+predicted log-scale is constrained to the range estimated in the final fitting
+windows (whose lower bound is itself floored at `log(1e-6)`). This prevents
+unsupported polynomial oscillations from becoming near-zero or enormous
+scales.
+
 ## Plotting
 
 ```python
