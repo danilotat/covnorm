@@ -94,21 +94,31 @@ location and log-scale surfaces use Ridge regression. With `B` valid bins, the
 effective objective is `mean_squared_error + ridge_alpha * ||coef||²`; the
 intercept is not penalized.
 
-## Plotting
+## Worm-plot diagnostics
 
 ```python
-from covnorm import plot_covariate_space
+from covnorm import plot_worm
 
-fig = plot_covariate_space(
+fig = plot_worm(
     normalizer,
-    data,
-    covariate_labels=["age"],
-    analyte_label="marker",
+    marker,
+    n_bins=6,
+    covariate_label="age",
+    marker_label="marker",
 )
-fig.savefig("normalization_surface.png", dpi=150)
+fig.savefig("marker_worm_plot.png", dpi=150)
 ```
 
-`plot_covariate_space` visualises the fitted polynomial surface on top of the raw data:
+`plot_worm` draws detrended normal Q-Q plots of the final normalized values.
+With continuous covariates, observations are split into equal-count,
+non-overlapping bins of the selected covariate. A well-calibrated normalizer
+produces approximately flat worms around zero inside the pointwise reference
+bands.
 
-- **1 continuous covariate** — scatter of raw values with a filled ribbon `μ(x) ± n_sigma · σ(x)` back-transformed to the original space.
-- **2 continuous covariates** — 3-D surface plot of `μ(x₁, x₂)` with the per-bin estimates scattered on top.
+Offsets indicate conditional location bias, slopes indicate scale bias, and
+curved patterns can reveal residual skewness or tail-weight mismatch. When two
+continuous covariates are present, use `covariate_index=0` or `1` to choose the
+conditioning variable. For new or held-out samples, pass matching
+`categorical_vals=` and `continuous_vals=` just as for `transform()`; held-out
+plots are preferable because their reference bands are not adjusted for fitting
+the normalizer on the same observations.
