@@ -1,7 +1,10 @@
+from math import ceil
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+from numpy.typing import ArrayLike
+from scipy import stats
 from scipy.special import inv_boxcox
 
 if TYPE_CHECKING:
@@ -9,6 +12,238 @@ if TYPE_CHECKING:
     import matplotlib.figure
 
     from covnorm._normalizer import RobustConditionalNormalizer
+
+
+def plot_worm(
+    normalizer: "RobustConditionalNormalizer",
+    X: ArrayLike,
+    marker_col: int = 0,
+    *,
+    categorical_vals: Optional[ArrayLike] = None,
+    continuous_vals: Optional[ArrayLike] = None,
+    covariate_index: int = 0,
+    n_bins: int = 6,
+    alpha: float = 0.05,
+    covariate_label: Optional[str] = None,
+    marker_label: Optional[str] = None,
+    figsize: Optional[Tuple[float, float]] = None,
+) -> "matplotlib.figure.Figure":
+    """Plot conditional detrended Q-Q plots of normalized marker values.
+
+    The plotted values are the final Z-scores returned by ``normalizer.transform``.
+    When continuous covariates are present, observations are split into equal-count,
+    non-overlapping bins of one selected covariate. A well-calibrated normalizer
+    produces worms that fluctuate around zero inside the pointwise normal-reference
+    bands.
+
+    Parameters
+    ----------
+    normalizer : fitted RobustConditionalNormalizer
+        Normalizer used to compute the diagnostic Z-scores.
+    X : array-like of shape (n_samples, n_markers) or (n_samples,)
+        Raw marker values. As with :meth:`RobustConditionalNormalizer.transform`,
+        covariates are supplied separately.
+    marker_col : int, default=0
+        Marker column in ``X`` to diagnose.
+    categorical_vals : array-like, optional
+        Categorical covariates for ``X``. Defaults to the values stored on the
+        normalizer. Pass this for new samples whose rows differ from the training
+        data.
+    continuous_vals : array-like, optional
+        Continuous covariates for ``X``. Defaults to the values stored on the
+        normalizer. Pass this for new samples whose rows differ from the training
+        data.
+    covariate_index : int, default=0
+        Continuous-covariate column used to form conditional panels. Ignored when
+        the normalizer has no continuous covariates.
+    n_bins : int, default=6
+        Requested number of equal-count conditional panels. It is reduced when
+        necessary to keep at least two observations per panel. With no continuous
+        covariates, one unconditional panel is drawn.
+    alpha : float, default=0.05
+        Pointwise error rate for the normal-reference bands.
+    covariate_label : str, optional
+        Label for the conditioning covariate. Defaults to
+        ``"continuous covariate {covariate_index}"``.
+    marker_label : str, optional
+        Label used in the figure title. Defaults to ``"marker {marker_col}"``.
+    figsize : tuple of (float, float), optional
+        Figure size. By default it is derived from the panel layout.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        Figure containing the worm-plot panels.
+
+    Notes
+    -----
+    The confidence bands are exact pointwise bands for normal order statistics.
+    They do not account for fitting the normalizer on the same observations, so a
+    held-out or out-of-fold ``X`` gives the most informative calibration check.
+    """
+    if not normalizer._fitters:
+        raise ValueError("Normalizer has not been fitted. Call fit() first.")
+    if isinstance(marker_col, bool) or not isinstance(marker_col, (int, np.integer)):
+        raise TypeError("marker_col must be an integer.")
+    if isinstance(n_bins, bool) or not isinstance(n_bins, (int, np.integer)):
+        raise TypeError("n_bins must be an integer.")
+    if n_bins < 1:
+        raise ValueError("n_bins must be at least 1.")
+    if not np.isfinite(alpha) or not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must be strictly between 0 and 1.")
+
+    z_scores = normalizer.transform(
+        X,
+        categorical_vals=categorical_vals,
+        continuous_vals=continuous_vals,
+    )
+    n_samples, n_markers = z_scores.shape
+    if marker_col < 0 or marker_col >= n_markers:
+        raise IndexError(
+            f"marker_col={marker_col} is out of range for X with {n_markers} columns."
+        )
+    if n_samples < 2:
+        raise ValueError("A worm plot requires at least two observations.")
+
+    residuals = np.asarray(z_scores[:, marker_col], dtype=float)
+    if not np.all(np.isfinite(residuals)):
+        raise ValueError("Normalized marker values must all be finite.")
+
+    cont_source = (
+        continuous_vals if continuous_vals is not None else normalizer.continuous_vals
+    )
+    cont_data = normalizer._coerce_covariates(cont_source, n_samples)
+    if cont_data.shape[0] != n_samples:
+        raise ValueError(
+            f"continuous_vals has {cont_data.shape[0]} rows but X has {n_samples}."
+        )
+
+    if cont_data.shape[1] == 0:
+        groups = [np.arange(n_samples)]
+        titles = [f"All observations (n={n_samples})"]
+    else:
+        if isinstance(covariate_index, bool) or not isinstance(
+            covariate_index, (int, np.integer)
+        ):
+            raise TypeError("covariate_index must be an integer.")
+        if covariate_index < 0 or covariate_index >= cont_data.shape[1]:
+            raise IndexError(
+                f"covariate_index={covariate_index} is out of range for "
+                f"continuous_vals with {cont_data.shape[1]} columns."
+            )
+        try:
+            covariate = np.asarray(cont_data[:, covariate_index], dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("The conditioning covariate must be numeric.") from exc
+        if not np.all(np.isfinite(covariate)):
+            raise ValueError(
+                "The conditioning covariate must contain only finite values."
+            )
+
+        label = (
+            covariate_label
+            if covariate_label is not None
+            else f"continuous covariate {covariate_index}"
+        )
+        groups = _equal_count_groups(covariate, n_bins)
+        titles = [
+            _format_bin_title(label, covariate[group], len(group)) for group in groups
+        ]
+
+    n_panels = len(groups)
+    n_cols = min(3, n_panels)
+    n_rows = ceil(n_panels / n_cols)
+    if figsize is None:
+        figsize = (4.0 * n_cols, 3.2 * n_rows)
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=figsize,
+        squeeze=False,
+        sharex=True,
+        sharey=True,
+    )
+    flat_axes = axes.ravel()
+
+    for panel, (ax, row_indices, title) in enumerate(zip(flat_axes, groups, titles)):
+        theoretical, deviation, lower, upper = _worm_coordinates(
+            residuals[row_indices], alpha
+        )
+        ax.fill_between(
+            theoretical,
+            lower,
+            upper,
+            color="0.9",
+            label=f"{100 * (1 - alpha):g}% pointwise band",
+        )
+        ax.axhline(0.0, color="0.35", linewidth=1.0, linestyle="--")
+        ax.scatter(
+            theoretical,
+            deviation,
+            s=12,
+            color="black",
+            alpha=0.65,
+            linewidths=0,
+            zorder=3,
+        )
+
+        degree = min(3, len(theoretical) - 1)
+        coefficients = np.polyfit(theoretical, deviation, degree)
+        line_x = np.linspace(theoretical[0], theoretical[-1], 200)
+        ax.plot(
+            line_x,
+            np.polyval(coefficients, line_x),
+            color="tomato",
+            linewidth=2.0,
+            label="cubic trend" if degree == 3 else "trend",
+        )
+        ax.set_title(title, fontsize=9)
+        ax.grid(alpha=0.15)
+        if panel == 0:
+            ax.legend(loc="best", fontsize=8)
+
+    for ax in flat_axes[n_panels:]:
+        fig.delaxes(ax)
+
+    name = marker_label if marker_label is not None else f"marker {marker_col}"
+    fig.suptitle(f"Worm plot — {name}")
+    fig.supxlabel("Theoretical normal quantile")
+    fig.supylabel("Observed − theoretical quantile")
+    fig.tight_layout()
+    return fig
+
+
+def _equal_count_groups(covariate: np.ndarray, n_bins: int) -> List[np.ndarray]:
+    """Return stable, non-overlapping groups with approximately equal counts."""
+    if np.ptp(covariate) == 0.0:
+        return [np.arange(len(covariate))]
+    effective_bins = min(n_bins, max(1, len(covariate) // 2))
+    order = np.argsort(covariate, kind="mergesort")
+    return [group for group in np.array_split(order, effective_bins) if len(group) > 0]
+
+
+def _format_bin_title(label: str, values: np.ndarray, count: int) -> str:
+    lower = np.min(values)
+    upper = np.max(values)
+    return f"{label}: {lower:.4g}–{upper:.4g} (n={count})"
+
+
+def _worm_coordinates(
+    residuals: np.ndarray, alpha: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return detrended Q-Q coordinates and exact pointwise normal bands."""
+    observed = np.sort(np.asarray(residuals, dtype=float))
+    n = len(observed)
+    ranks = np.arange(1, n + 1)
+    probabilities = (ranks - 3.0 / 8.0) / (n + 1.0 / 4.0)
+    theoretical = stats.norm.ppf(probabilities)
+    deviation = observed - theoretical
+
+    lower_probability = stats.beta.ppf(alpha / 2.0, ranks, n + 1 - ranks)
+    upper_probability = stats.beta.ppf(1.0 - alpha / 2.0, ranks, n + 1 - ranks)
+    lower = stats.norm.ppf(lower_probability) - theoretical
+    upper = stats.norm.ppf(upper_probability) - theoretical
+    return theoretical, deviation, lower, upper
 
 
 def plot_covariate_space(
@@ -236,4 +471,4 @@ def _plot_surface_3d(
     return fig
 
 
-__all__ = ["plot_covariate_space"]
+__all__ = ["plot_covariate_space", "plot_worm"]
