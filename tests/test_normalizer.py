@@ -18,6 +18,7 @@ import warnings
 import numpy as np
 import pytest
 from sklearn.base import clone
+from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
 
 from covnorm import ContinuousSurfaceFitter, RobustConditionalNormalizer
@@ -90,6 +91,7 @@ def test_get_params():
     assert "target_col" not in params
     assert params["n_bins"] == 8
     assert params["degree"] == 3
+    assert params["ridge_alpha"] == 0.05
     assert params["anchor_strategy"] == "farthest_point"
     assert params["transform_continuous"] is None
 
@@ -99,9 +101,10 @@ def test_set_params():
     cat = rng.integers(0, 2, (10, 1)).astype(float)
     cont = rng.uniform(0, 1, (10, 1))
     norm = RobustConditionalNormalizer(categorical_vals=cat, continuous_vals=cont)
-    norm.set_params(n_bins=10, degree=1)
+    norm.set_params(n_bins=10, degree=1, ridge_alpha=0.1)
     assert norm.n_bins == 10
     assert norm.degree == 1
+    assert norm.ridge_alpha == 0.1
 
 
 def test_clone_produces_unfitted_copy(normalizer_full, data):
@@ -441,6 +444,74 @@ def test_surface_fitter_sigma_strictly_positive(rng=RNG):
     assert np.all(sigma > 0)
 
 
+def test_surface_fitter_fits_log_sigma_targets(monkeypatch):
+    rng = np.random.default_rng(420)
+    X_cont = rng.uniform(0, 100, (300, 1))
+    y = rng.gamma(2.0, 1.0, 300)
+    fitter = ContinuousSurfaceFitter(n_bins=6, degree=2, lambda_=0.0, n_iterations=1)
+    captured = {}
+    original_fit = Ridge.fit
+
+    def capture_sigma_target(model, X, target, *args, **kwargs):
+        if model is fitter.sigma_model:
+            captured["target"] = np.asarray(target).copy()
+        return original_fit(model, X, target, *args, **kwargs)
+
+    monkeypatch.setattr(Ridge, "fit", capture_sigma_target)
+    fitter.fit(X_cont, y)
+
+    np.testing.assert_allclose(
+        captured["target"], np.log(np.maximum(fitter.bin_sigma_, 1e-6))
+    )
+
+
+def test_surface_fitter_scales_polynomial_features_and_applies_relative_ridge():
+    rng = np.random.default_rng(423)
+    X_cont = rng.uniform(1, 100, (300, 1))
+    y = rng.gamma(2.0, 1.0, 300)
+    fitter = ContinuousSurfaceFitter(
+        n_bins=6, degree=2, ridge_alpha=0.05, n_iterations=1
+    ).fit(X_cont, y)
+
+    X_poly = fitter.poly_transformer.transform(fitter.bin_centers_)
+    X_poly_scaled = fitter.poly_scaler.transform(X_poly)
+    np.testing.assert_allclose(X_poly_scaled.mean(axis=0), 0.0, atol=1e-12)
+    # The bias column is constant and becomes zero; all actual polynomial terms
+    # have unit population standard deviation.
+    np.testing.assert_allclose(X_poly_scaled[:, 1:].std(axis=0), 1.0)
+
+    effective_alpha = 0.05 * len(fitter.bin_centers_)
+    assert fitter.mu_model.alpha == pytest.approx(effective_alpha)
+    assert fitter.sigma_model.alpha == pytest.approx(effective_alpha)
+
+
+def test_surface_fitter_floors_log_sigma_before_exponentiating():
+    rng = np.random.default_rng(421)
+    X_cont = rng.uniform(1, 100, (300, 1))
+    y = rng.gamma(2.0, 1.0, 300)
+    fitter = ContinuousSurfaceFitter(n_bins=6, degree=2).fit(X_cont, y)
+
+    # A very negative constant log-scale sits below every final fitting window.
+    fitter.sigma_model.coef_ = np.zeros_like(fitter.sigma_model.coef_)
+    fitter.sigma_model.intercept_ = -1e6
+    _, sigma = fitter.predict_mu_sigma(X_cont)
+
+    np.testing.assert_allclose(sigma, np.min(fitter.bin_sigma_))
+
+
+def test_surface_fitter_caps_log_sigma_before_exponentiating():
+    rng = np.random.default_rng(422)
+    X_cont = rng.uniform(1, 100, (300, 1))
+    y = rng.gamma(2.0, 1.0, 300)
+    fitter = ContinuousSurfaceFitter(n_bins=6, degree=2).fit(X_cont, y)
+
+    fitter.sigma_model.coef_ = np.zeros_like(fitter.sigma_model.coef_)
+    fitter.sigma_model.intercept_ = 1e6
+    _, sigma = fitter.predict_mu_sigma(X_cont)
+
+    np.testing.assert_allclose(sigma, np.max(fitter.bin_sigma_))
+
+
 # ---------------------------------------------------------------------------
 # Continuous-covariate transformations
 # ---------------------------------------------------------------------------
@@ -455,6 +526,29 @@ def _make_two_covariate_surface_data(n=600, seed=123):
     week_z = (week - week.mean()) / week.std()
     y = np.exp(2.0 + 0.25 * weight_z - 0.15 * week_z + rng.normal(0.0, 0.2, n))
     return X_cont, y
+
+
+def test_ridge_stabilizes_correlated_degree_three_surface():
+    X_cont, y = _make_two_covariate_surface_data(seed=321)
+    kwargs = dict(
+        n_bins=30,
+        degree=3,
+        lambda_=0.0,
+        n_iterations=1,
+        transform_continuous="zscore",
+    )
+    unregularized = ContinuousSurfaceFitter(ridge_alpha=0.0, **kwargs).fit(X_cont, y)
+    regularized = ContinuousSurfaceFitter(ridge_alpha=0.05, **kwargs).fit(X_cont, y)
+
+    def unsupported_log_scales(fitter):
+        X_transformed = fitter._transform_continuous_covariates(X_cont, fit=False)
+        X_poly = fitter.poly_transformer.transform(X_transformed)
+        X_poly_scaled = fitter.poly_scaler.transform(X_poly)
+        log_sigma = fitter.sigma_model.predict(X_poly_scaled)
+        lower, upper = fitter._log_sigma_bounds_
+        return int(np.count_nonzero((log_sigma < lower) | (log_sigma > upper)))
+
+    assert unsupported_log_scales(regularized) < unsupported_log_scales(unregularized)
 
 
 def test_zscore_transform_uses_training_statistics_and_reuses_them_for_prediction():
@@ -527,18 +621,50 @@ def test_transform_continuous_log10_matches_legacy_boolean():
     y = rng.gamma(3.0, 2.0, 400)
     kwargs = dict(n_bins=8, degree=2, lambda_=0.2, n_iterations=1)
 
-    legacy = ContinuousSurfaceFitter(**kwargs, log_transform_continuous=True).fit(
-        X_cont, y
-    )
-    current = ContinuousSurfaceFitter(**kwargs, transform_continuous="log10").fit(
-        X_cont, y
-    )
+    with pytest.warns(FutureWarning, match="removed in covnorm 1.x") as caught:
+        legacy = ContinuousSurfaceFitter(**kwargs, log_transform_continuous=True).fit(
+            X_cont, y
+        )
+    assert len(caught) == 1
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        current = ContinuousSurfaceFitter(**kwargs, transform_continuous="log10").fit(
+            X_cont, y
+        )
 
     np.testing.assert_allclose(legacy.bin_centers_, current.bin_centers_)
     mu_legacy, sigma_legacy = legacy.predict_mu_sigma(X_cont)
     mu_current, sigma_current = current.predict_mu_sigma(X_cont)
     np.testing.assert_allclose(mu_legacy, mu_current)
     np.testing.assert_allclose(sigma_legacy, sigma_current)
+
+
+def test_normalizer_warns_once_for_legacy_log_alias_across_multiple_markers():
+    rng = np.random.default_rng(790)
+    n = 400
+    cont = rng.uniform(1.0, 1000.0, (n, 1))
+    markers = rng.gamma(3.0, 2.0, (n, 2))
+    normalizer = RobustConditionalNormalizer(
+        categorical_vals=np.empty((n, 0)),
+        continuous_vals=cont,
+        n_bins=8,
+        degree=2,
+        n_iterations=1,
+        log_transform_continuous=True,
+    )
+
+    with pytest.warns(FutureWarning, match="removed in covnorm 1.x") as caught:
+        normalizer.fit(markers)
+
+    assert len(caught) == 1
+    assert all(
+        fitter._resolved_transform_continuous_ == "log10"
+        for fitter in normalizer._fitters.values()
+    )
+    assert all(
+        not fitter.log_transform_continuous for fitter in normalizer._fitters.values()
+    )
 
 
 def test_transform_continuous_validation_and_legacy_conflict():
@@ -558,6 +684,13 @@ def test_transform_continuous_validation_and_legacy_conflict():
             continuous_vals=cont,
             log_transform_continuous=True,
             transform_continuous="zscore",
+        )
+
+    with pytest.raises(ValueError, match="ridge_alpha"):
+        RobustConditionalNormalizer(
+            categorical_vals=cat,
+            continuous_vals=cont,
+            ridge_alpha=-0.1,
         )
 
 
@@ -680,11 +813,13 @@ class TestAnovaGating:
         n = 600
         cat = np.repeat([0.0, 1.0], n // 2).reshape(-1, 1)
         cont = rng.uniform(1, 80, (n, 1))
-        # Large scale ratio creates clear mean and variance differences in z_base
+        # Construct differences that remain in both location and scale after the
+        # marker transformation. A pure Gamma scale-family difference can be
+        # largely removed by Box-Cox and is not a reliable Levene fixture.
         marker = np.concatenate(
             [
-                rng.gamma(2, 5, (n // 2, 1)),
-                rng.gamma(2, 30, (n // 2, 1)),
+                np.exp(rng.normal(0.0, 0.2, (n // 2, 1))),
+                np.exp(rng.normal(1.0, 1.0, (n // 2, 1))),
             ]
         )
 
@@ -787,7 +922,7 @@ class TestAnovaGating:
             )
 
 
-def test_fit_survives_outlier_mask_collapsing_to_empty():
+def test_fit_survives_outlier_mask_collapsing_to_empty(monkeypatch):
     """Regression test for a crash in the iterative outlier-rejection loop.
 
     A near-degenerate target (e.g. a zero-inflated marker, >99% identical
@@ -811,6 +946,16 @@ def test_fit_survives_outlier_mask_collapsing_to_empty():
     )
     fitter = ContinuousSurfaceFitter(
         n_bins=20, degree=3, n_iterations=3, bin_size=200, zero_handles="eps"
+    )
+
+    # Keep this regression independent of the surface estimator: Ridge can
+    # legitimately avoid the natural collapse that originally exposed the bug.
+    # A uniformly tiny predicted scale deterministically exercises the same
+    # all-false outlier mask and proves the loop still stops before an empty refit.
+    monkeypatch.setattr(
+        fitter,
+        "_predict_sigma_from_poly",
+        lambda X_poly: np.full(X_poly.shape[0], 1e-6),
     )
 
     with pytest.warns(
@@ -999,19 +1144,16 @@ def test_marginal_estimates_are_available_after_a_successful_surface_fit(rng=RNG
     assert fitter.marginal_sigma_ > 0
 
 
-def test_predict_mu_sigma_substitutes_marginal_when_sigma_is_non_positive(rng=RNG):
-    """A polynomial that predicts sigma <= 0 is invalid at that covariate value,
-    not evidence of a vanishing scale. Flooring it at 1e-6 turns "the model does
-    not apply here" into a Z-score of ~1e6; degrade to the marginal fit instead."""
+def test_predict_mu_sigma_substitutes_marginal_when_log_sigma_is_non_finite(rng=RNG):
+    """A non-finite log-scale is unsupported and degrades to the marginal fit."""
     X = rng.uniform(0, 100, (300, 1))
     y = rng.gamma(2.0, 1.0, 300)
     fitter = ContinuousSurfaceFitter(n_bins=6, degree=2)
     fitter.fit(X, y)
 
-    # Force the scale surface negative everywhere (X and its powers are positive).
-    fitter.sigma_model.coef_ = -np.abs(fitter.sigma_model.coef_) - 1.0
+    fitter.sigma_model.intercept_ = np.nan
 
-    with pytest.warns(UserWarning, match="non-positive sigma"):
+    with pytest.warns(UserWarning, match="invalid mu or sigma"):
         mu, sigma = fitter.predict_mu_sigma(X)
 
     assert np.all(sigma > 0)

@@ -6,18 +6,30 @@ from typing import List, Optional, Tuple
 import numpy as np
 import scipy.stats as stats
 from scipy.stats import boxcox, yeojohnson
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import Ridge
 from sklearn.neighbors import KDTree
-from sklearn.preprocessing import PolynomialFeatures
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 
 _ANCHOR_STRATEGIES = ("farthest_point", "projection_rank")
 _CONTINUOUS_TRANSFORMS = (None, "log10", "zscore")
+_SIGMA_FLOOR = 1e-6
+_LOG_SIGMA_FLOOR = float(np.log(_SIGMA_FLOOR))
+
+
+def _warn_log_transform_continuous_deprecated() -> None:
+    warnings.warn(
+        "log_transform_continuous is deprecated and will be removed in covnorm "
+        "1.x; use transform_continuous='log10' instead.",
+        FutureWarning,
+        stacklevel=3,
+    )
 
 
 def _resolve_continuous_transform(
     transform_continuous: Optional[str], log_transform_continuous: bool
 ) -> Optional[str]:
     """Resolve the new transform option and its legacy boolean alias."""
+    # TODO(v1.x): remove log_transform_continuous and this legacy resolution path.
     if transform_continuous not in _CONTINUOUS_TRANSFORMS:
         raise ValueError(
             "transform_continuous must be one of None, 'log10', or 'zscore'; "
@@ -86,6 +98,10 @@ class ContinuousSurfaceFitter:
     degree : int, default=3
         Degree of the polynomial curve fitted to the window estimates.
         Mørkved et al. (2015) use cubic polynomials.
+    ridge_alpha : float, default=0.05
+        L2 penalty relative to the mean squared fitting loss for both the mu and
+        log-sigma surfaces. The value passed to scikit-learn is
+        ``ridge_alpha * n_valid_bins``. Set to ``0.0`` to disable regularization.
     lambda_ : float or None, default=None
         Box-Cox transformation (or Jeo-Yohnson) parameter. When ``None`` the
         optimal value is found via a grid search over [-2, 2] that maximises the Pearson correlation between sorted BoxCox(y) values and their theoretical
@@ -97,7 +113,8 @@ class ContinuousSurfaceFitter:
         conditional Z-score exceeds 3.372 in absolute value.
     log_transform_continuous : bool, default=False
         Legacy alias for ``transform_continuous='log10'``. Retained for
-        backward compatibility. It cannot be combined with
+        backward compatibility and scheduled for removal in version 1.x. Using
+        it emits ``FutureWarning``. It cannot be combined with
         ``transform_continuous='zscore'``.
     bin_size : int, default=120
         Number of samples per rolling window. Mørkved et al. (2015) use 120.
@@ -143,10 +160,14 @@ class ContinuousSurfaceFitter:
     ----------
     poly_transformer : sklearn.preprocessing.PolynomialFeatures
         Transforms covariate vectors into polynomial feature matrices.
-    mu_model : sklearn.linear_model.LinearRegression
-        Linear model predicting mu (in Box-Cox space) from polynomial features.
-    sigma_model : sklearn.linear_model.LinearRegression
-        Linear model predicting sigma (in Box-Cox space) from polynomial features.
+    poly_scaler : sklearn.preprocessing.StandardScaler
+        Standardizes polynomial feature columns before Ridge fitting, making the
+        penalty independent of the covariates' units and polynomial powers.
+    mu_model : sklearn.linear_model.Ridge
+        Ridge model predicting mu (in Box-Cox space) from polynomial features.
+    sigma_model : sklearn.linear_model.Ridge
+        Ridge model predicting log-sigma from polynomial features. Predictions
+        are exponentiated back to sigma in Box-Cox space.
     lambda_ : float
         Box-Cox (or Jeo-Yohnson) parameter; ``None`` until :meth:`fit` is called.
     _global_mu : float
@@ -187,6 +208,11 @@ class ContinuousSurfaceFitter:
     position formula ``(i - 3/8) / (n + 1/4)``. The slope gives sigma
     and the intercept gives mu, both in Box-Cox space. Sigma is floored
     at ``1e-6`` to prevent division by zero during Z-score computation.
+    The polynomial scale surface is fitted to the logarithm of the per-window
+    sigma estimates. At prediction time finite log-scale outputs are constrained
+    to the range observed in the final fitting windows and exponentiated, so
+    every finite scale prediction is strictly positive and remains supported by
+    the fitted window estimates.
     """
 
     def __init__(
@@ -200,9 +226,11 @@ class ContinuousSurfaceFitter:
         zero_handles: str = "eps",
         anchor_strategy: str = "farthest_point",
         transform_continuous: Optional[str] = None,
+        ridge_alpha: float = 0.05,
     ):
         self.n_bins = n_bins
         self.degree = degree
+        self.ridge_alpha = ridge_alpha
         self.lambda_ = lambda_
         self.n_iterations = n_iterations
         self.log_transform_continuous = log_transform_continuous
@@ -210,8 +238,9 @@ class ContinuousSurfaceFitter:
         self.poly_transformer = PolynomialFeatures(
             degree=self.degree, include_bias=True
         )
-        self.mu_model = LinearRegression(fit_intercept=False)
-        self.sigma_model = LinearRegression(fit_intercept=False)
+        self.poly_scaler = StandardScaler()
+        self.mu_model = Ridge(alpha=self.ridge_alpha, fit_intercept=True)
+        self.sigma_model = Ridge(alpha=self.ridge_alpha, fit_intercept=True)
         self._global_mu: float = 0.0
         self._global_sigma: float = 1.0
         self._is_fitted: bool = False
@@ -223,6 +252,7 @@ class ContinuousSurfaceFitter:
         self.bin_sigma_: Optional[np.ndarray] = None
         self.marginal_mu_: Optional[float] = None
         self.marginal_sigma_: Optional[float] = None
+        self._log_sigma_bounds_: Optional[Tuple[float, float]] = None
 
     def fit(self, X_cont: np.ndarray, y: np.ndarray) -> "ContinuousSurfaceFitter":
         """Fit the polynomial mu/sigma curve to rolling window estimates.
@@ -258,6 +288,20 @@ class ContinuousSurfaceFitter:
                 f"anchor_strategy must be one of {_ANCHOR_STRATEGIES}; "
                 f"got {self.anchor_strategy!r}."
             )
+        if (
+            not isinstance(self.ridge_alpha, (int, float, np.number))
+            or not np.isfinite(self.ridge_alpha)
+            or self.ridge_alpha < 0.0
+        ):
+            raise ValueError(
+                f"ridge_alpha must be a finite non-negative number; "
+                f"got {self.ridge_alpha!r}."
+            )
+        _resolve_continuous_transform(
+            self.transform_continuous, self.log_transform_continuous
+        )
+        if self.log_transform_continuous:
+            _warn_log_transform_continuous_deprecated()
 
         _, n_features = X_cont.shape
         X_cont = self._transform_continuous_covariates(X_cont, fit=True)
@@ -275,7 +319,7 @@ class ContinuousSurfaceFitter:
             y_bc_full = self._transform(y, self.lambda_)
             m_mu, m_sigma = float(np.mean(y_bc_full)), float(np.std(y_bc_full))
         self.marginal_mu_ = float(m_mu)
-        self.marginal_sigma_ = max(float(m_sigma), 1e-6)
+        self.marginal_sigma_ = max(float(m_sigma), _SIGMA_FLOOR)
 
         if n_features == 0:
             self._fit_fallback(y)
@@ -307,16 +351,28 @@ class ContinuousSurfaceFitter:
                 return self
 
             X_poly = self.poly_transformer.fit_transform(np.array(valid_centers))
-            self.mu_model.fit(X_poly, mu_estimates)
-            self.sigma_model.fit(X_poly, sigma_estimates)
+            X_poly_scaled = self.poly_scaler.fit_transform(X_poly)
+            effective_alpha = float(self.ridge_alpha) * len(valid_centers)
+            self.mu_model.set_params(alpha=effective_alpha)
+            self.sigma_model.set_params(alpha=effective_alpha)
+            self.mu_model.fit(X_poly_scaled, mu_estimates)
+            log_sigma_estimates = np.log(
+                np.maximum(np.asarray(sigma_estimates), _SIGMA_FLOOR)
+            )
+            self.sigma_model.fit(X_poly_scaled, log_sigma_estimates)
+            self._log_sigma_bounds_ = (
+                float(np.min(log_sigma_estimates)),
+                float(np.max(log_sigma_estimates)),
+            )
             self._is_fitted = True
             self.bin_centers_ = np.array(valid_centers)
             self.bin_mu_ = np.array(mu_estimates)
             self.bin_sigma_ = np.array(sigma_estimates)
 
             X_poly_work = self.poly_transformer.transform(X_work)
-            mu_pred = self.mu_model.predict(X_poly_work)
-            sigma_pred = np.maximum(self.sigma_model.predict(X_poly_work), 1e-6)
+            X_poly_work_scaled = self.poly_scaler.transform(X_poly_work)
+            mu_pred = self.mu_model.predict(X_poly_work_scaled)
+            sigma_pred = self._predict_sigma_from_poly(X_poly_work_scaled)
             y_bc = self._transform(y_work, self.lambda_)
 
             z = (y_bc - mu_pred) / sigma_pred
@@ -357,16 +413,10 @@ class ContinuousSurfaceFitter:
         Warns
         -----
         UserWarning
-            When the polynomial predicts a non-positive or non-finite scale for
+            When the polynomial predicts a non-finite location or log-scale for
             one or more samples. Such a sample sits where the surface is not
-            supported by the training covariates -- the polynomial is extrapolating
-            and the prediction is invalid, rather than describing a genuinely
-            vanishing scale. Both ``mu`` and ``sigma`` degrade to the marginal fit
-            there: clamping ``sigma`` to a small floor instead would turn "the
-            model does not apply here" into a Z-score of ~1e6, and because
-            :meth:`RobustConditionalNormalizer.fit` estimates its per-group
-            correction from these Z-scores, a single such sample in the reference
-            would blind the whole column.
+            supported by the training covariates. Both ``mu`` and ``sigma``
+            degrade to the marginal fit there.
         """
         if not self._is_fitted or X_cont.shape[1] == 0:
             return (
@@ -375,13 +425,14 @@ class ContinuousSurfaceFitter:
             )
         X_cont = self._transform_continuous_covariates(X_cont, fit=False)
         X_poly = self.poly_transformer.transform(X_cont)
-        mu = self.mu_model.predict(X_poly)
-        sigma = self.sigma_model.predict(X_poly)
+        X_poly_scaled = self.poly_scaler.transform(X_poly)
+        mu = self.mu_model.predict(X_poly_scaled)
+        sigma = self._predict_sigma_from_poly(X_poly_scaled)
 
         invalid = ~np.isfinite(sigma) | (sigma <= 0.0) | ~np.isfinite(mu)
         if invalid.any():
             warnings.warn(
-                f"Polynomial surface predicted non-positive sigma for "
+                f"Polynomial surface predicted an invalid mu or sigma for "
                 f"{int(invalid.sum())} of {invalid.size} samples; those covariate "
                 f"values are outside the region the surface supports. Falling back "
                 f"to the marginal (covariate-free) fit for them."
@@ -389,6 +440,26 @@ class ContinuousSurfaceFitter:
             mu = np.where(invalid, self.marginal_mu_, mu)
             sigma = np.where(invalid, self.marginal_sigma_, sigma)
         return mu, sigma
+
+    def _predict_sigma_from_poly(self, X_poly: np.ndarray) -> np.ndarray:
+        """Predict a strictly positive sigma from polynomial features.
+
+        ``sigma_model`` owns the unconstrained log-scale surface. Finite outputs
+        are constrained to the range of log-scales actually estimated in the
+        final fitting windows, preventing unsupported polynomial oscillations
+        from becoming near-zero or enormous scales after exponentiation. The
+        lower bound is never below ``log(1e-6)``. Non-finite predictions remain
+        non-finite so :meth:`predict_mu_sigma` can degrade them to the marginal
+        fit instead of silently treating them as valid scales.
+        """
+        log_sigma = self.sigma_model.predict(X_poly)
+        lower, upper = self._log_sigma_bounds_
+        lower = max(lower, _LOG_SIGMA_FLOOR)
+        finite = np.isfinite(log_sigma)
+        bounded_log_sigma = log_sigma.copy()
+        bounded_log_sigma[finite] = np.clip(log_sigma[finite], lower, upper)
+        with np.errstate(over="ignore", invalid="ignore"):
+            return np.exp(bounded_log_sigma)
 
     def _transform_continuous_covariates(
         self, X_cont: np.ndarray, *, fit: bool
@@ -674,7 +745,7 @@ class ContinuousSurfaceFitter:
             return None, None
 
         sigma, mu = np.polyfit(z_theoretical, bin_data_bc, deg=1)
-        return mu, max(sigma, 1e-6)
+        return mu, max(sigma, _SIGMA_FLOOR)
 
     def _fit_fallback(self, y: np.ndarray) -> None:
         """Set global mu/sigma (in Box-Cox space) when binning is not viable.
@@ -688,10 +759,11 @@ class ContinuousSurfaceFitter:
         if mu is None or sigma is None:
             y_bc = self._transform(y, self.lambda_)
             self._global_mu = float(np.mean(y_bc))
-            self._global_sigma = max(float(np.std(y_bc)), 1e-6)
+            self._global_sigma = max(float(np.std(y_bc)), _SIGMA_FLOOR)
         else:
             self._global_mu = mu
             self._global_sigma = sigma
+        self._log_sigma_bounds_ = None
         self._is_fitted = False
 
 
