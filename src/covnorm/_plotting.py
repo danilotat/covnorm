@@ -7,6 +7,8 @@ from numpy.typing import ArrayLike
 from scipy import stats
 from scipy.special import inv_boxcox
 
+from covnorm._surface_fitter import _ZSCORE_OUTLIER_THRESHOLD
+
 if TYPE_CHECKING:
     import matplotlib.axes
     import matplotlib.figure
@@ -80,6 +82,11 @@ def plot_worm(
     The confidence bands are exact pointwise bands for normal order statistics.
     They do not account for fitting the normalizer on the same observations, so a
     held-out or out-of-fold ``X`` gives the most informative calibration check.
+
+    Each panel reports the median Z-score, the normal-consistent MAD scale, and
+    the percentages below and above the normalizer's outlier threshold
+    (``-3.372`` and ``+3.372``). A calibrated panel has median and tail percentages
+    near zero and MAD scale near one.
     """
     if not normalizer._fitters:
         raise ValueError("Normalizer has not been fitted. Call fit() first.")
@@ -166,9 +173,8 @@ def plot_worm(
     flat_axes = axes.ravel()
 
     for panel, (ax, row_indices, title) in enumerate(zip(flat_axes, groups, titles)):
-        theoretical, deviation, lower, upper = _worm_coordinates(
-            residuals[row_indices], alpha
-        )
+        panel_residuals = residuals[row_indices]
+        theoretical, deviation, lower, upper = _worm_coordinates(panel_residuals, alpha)
         ax.fill_between(
             theoretical,
             lower,
@@ -198,6 +204,23 @@ def plot_worm(
             label="cubic trend" if degree == 3 else "trend",
         )
         ax.set_title(title, fontsize=9)
+        ax.text(
+            0.02,
+            0.98,
+            _format_worm_statistics(panel_residuals),
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=7,
+            linespacing=1.25,
+            bbox={
+                "boxstyle": "round,pad=0.25",
+                "facecolor": "white",
+                "edgecolor": "none",
+                "alpha": 0.8,
+            },
+            zorder=4,
+        )
         ax.grid(alpha=0.15)
         if panel == 0:
             ax.legend(loc="best", fontsize=8)
@@ -244,6 +267,27 @@ def _worm_coordinates(
     lower = stats.norm.ppf(lower_probability) - theoretical
     upper = stats.norm.ppf(upper_probability) - theoretical
     return theoretical, deviation, lower, upper
+
+
+def _worm_statistics(
+    residuals: np.ndarray,
+) -> Tuple[float, float, float, float]:
+    """Return median, normal-consistent MAD, and lower/upper tail fractions."""
+    residuals = np.asarray(residuals, dtype=float)
+    median = float(np.median(residuals))
+    mad = float(np.median(np.abs(residuals - median)))
+    mad_scale = mad / float(stats.norm.ppf(0.75))
+    lower_tail = float(np.mean(residuals < -_ZSCORE_OUTLIER_THRESHOLD))
+    upper_tail = float(np.mean(residuals > _ZSCORE_OUTLIER_THRESHOLD))
+    return median, mad_scale, lower_tail, upper_tail
+
+
+def _format_worm_statistics(residuals: np.ndarray) -> str:
+    median, mad_scale, lower_tail, upper_tail = _worm_statistics(residuals)
+    return (
+        f"median={median:+.2f}  MADσ={mad_scale:.2f}\n"
+        f"tail−={100 * lower_tail:.2f}%  tail+={100 * upper_tail:.2f}%"
+    )
 
 
 def plot_covariate_space(
