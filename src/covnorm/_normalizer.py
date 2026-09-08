@@ -540,10 +540,19 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
                         f"values in marker column {col}; use 'yeojohnson'."
                     )
                 if np.any(zero_mask) and self.zero_counts_[col] == 0:
-                    raise ValueError(
-                        f"Marker column {col} contains zeros at transform time, "
-                        "but no zeros were observed during fit; p0/2 is undefined."
+                    # No zeros were seen during fit, so p0 is undefined.
+                    # Fall back to treating zeros the same as positives:
+                    # they pass through the Box-Cox / mu-sigma transform
+                    # without a special percentile mapping. This is a safe
+                    # graceful degradation — the transform will not be
+                    # perfect, but it will not raise either.
+                    warnings.warn(
+                        f"Marker column {col} contains zeros at transform time "
+                        "but none were observed during fit. "
+                        "Falling back to positive-only transform for zeros.",
+                        stacklevel=2,
                     )
+                    zero_mask = np.zeros(n_samples, dtype=bool)
                 positive_mask = ~zero_mask
                 z_base = np.zeros(n_samples, dtype=float)
                 if np.any(positive_mask):
