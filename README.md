@@ -76,6 +76,8 @@ marker_new_norm = normalizer.transform(
 | `transform_continuous` | `None` | Continuous-covariate transform: `None` keeps the original values, `"log10"` applies a base-10 logarithm, and `"zscore"` subtracts the training mean and divides by the population standard deviation. Fitted parameters are reused at inference. |
 | `log_transform_continuous` | `False` | Deprecated alias for `transform_continuous="log10"`. Emits `FutureWarning`, cannot be combined with `"zscore"`, and will be removed in version 1.x. |
 | `zero_handles` | `"percentile"` | Zero strategy: `"percentile"` excludes zeros from Box-Cox/surface fitting and maps their observed mass at transform time; `"eps"` retains the legacy `1e-6` offset; `"yeojohnson"` uses Yeo-Johnson for all values and supports zeros and negatives. |
+| `unseen_zero_quantile` | `0.01` | Quantile of the training positives used as the detection-limit proxy for a marker that had no zeros during fitting. Must be in `(0, 1)`. |
+| `unseen_zero_fraction` | `0.5` | Fraction of that proxy actually imputed (the LOD/2 convention). Must be in `(0, 1]`. |
 
 `transform_continuous` acts on the continuous covariates, whereas Box-Cox or
 Yeo-Johnson acts on each marker. The two transformations serve different
@@ -123,9 +125,41 @@ z_final    = normal_ppf(u_positive)
 Here `normal_cdf` and `normal_ppf` are respectively `scipy.stats.norm.cdf` and
 `scipy.stats.norm.ppf`. The learned values are exposed in `zero_counts_`,
 `zero_fractions_`, and `zero_zscores_`, keyed by marker-column index, and are
-reused unchanged for new batches. If a marker had no zero during fitting but
-receives one during transform, the transformer raises `ValueError` because its
-training prevalence is undefined.
+reused unchanged for new batches.
+
+#### Zeros unseen during fitting
+
+A marker with no training zeros has `p0 = 0`, so `normal_ppf(p0 / 2)` is
+undefined and there is no tied mass to map positives above. Such a zero is
+instead treated as a **left-censored** observation and imputed, in raw value
+space, at a detection-limit proxy learned during `fit`:
+
+```text
+zero_floors_[col] = unseen_zero_fraction * quantile(positives, unseen_zero_quantile)
+```
+
+By default that is half the first percentile of the observed positives — the
+classic LOD/2 substitution, with a low quantile standing in for the unknown
+detection limit. A low quantile is used rather than the sample minimum so that
+one extreme observation cannot dictate the score of every future zero. The
+imputed value is then scored through the ordinary positive path (Box-Cox,
+conditional mu/sigma, categorical correction) and `transform` emits a
+`UserWarning`.
+
+Imputing a concentration rather than pinning a score has two consequences.
+The score is **covariate-adjusted**: the same zero is more extreme where the
+conditional reference range sits higher, which is correct, because a detection
+limit is a property of the assay and not of the sample. And a transform-time
+positive whose raw value falls *below* the floor scores below the imputed zero;
+at the assay floor that ordering carries no meaning, and `fit` logs at `INFO`
+how many training positives sit below the floor so a badly placed floor is
+visible.
+
+This replaces `zero_handles="eps"` as the fallback for such columns. With
+`"eps"` the score is a function of the `1e-6` constant and of the Box-Cox
+lambda rather than of the data: measured on a zero-free fit at n=400, an `eps`
+zero scores about −4.0 at lambda 0.30 and about −12 to −13 at lambda 0, whereas
+the imputation floor scores about −2.4 and −2.7 to −3.2 respectively.
 
 ## Worm-plot diagnostics
 

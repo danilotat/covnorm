@@ -37,6 +37,42 @@ def _robust_scale(values: np.ndarray) -> float:
     return float(np.std(values))
 
 
+def _check_unseen_zero_params(quantile: float, fraction: float) -> None:
+    """Validate the detection-limit-proxy parameters used for unseen zeros.
+
+    Parameters
+    ----------
+    quantile : float
+        Candidate ``unseen_zero_quantile``. Must be a finite real number in
+        the open interval ``(0, 1)``.
+    fraction : float
+        Candidate ``unseen_zero_fraction``. Must be a finite real number in
+        ``(0, 1]``.
+
+    Raises
+    ------
+    ValueError
+        If either value is not a finite real number, is a ``bool``, or falls
+        outside its permitted interval.
+    """
+    if isinstance(quantile, (bool, np.bool_)) or not isinstance(
+        quantile, (int, float, np.number)
+    ):
+        raise ValueError(
+            f"unseen_zero_quantile must be a real number; got {quantile!r}."
+        )
+    if not np.isfinite(quantile) or not (0.0 < float(quantile) < 1.0):
+        raise ValueError(f"unseen_zero_quantile must be in (0, 1); got {quantile!r}.")
+    if isinstance(fraction, (bool, np.bool_)) or not isinstance(
+        fraction, (int, float, np.number)
+    ):
+        raise ValueError(
+            f"unseen_zero_fraction must be a real number; got {fraction!r}."
+        )
+    if not np.isfinite(fraction) or not (0.0 < float(fraction) <= 1.0):
+        raise ValueError(f"unseen_zero_fraction must be in (0, 1]; got {fraction!r}.")
+
+
 class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
     """Robust conditional Z-score normalization over categorical and continuous covariates.
 
@@ -100,9 +136,12 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         from lambda, surface, and categorical-correction fitting. At transform
         time it treats zeros as the lowest tied mass: if their training
         prevalence is ``p0``, they receive ``norm.ppf(p0 / 2)`` and positive
-        scores are mapped above that mass. ``'eps'`` retains the legacy
-        ``1e-6`` Box-Cox offset. ``'yeojohnson'`` uses Yeo-Johnson for every
-        value and supports negatives.
+        scores are mapped above that mass. A zero arriving in a column that had
+        none during fitting has no training prevalence, so it is instead imputed
+        at a detection-limit proxy and scored conditionally -- see
+        ``unseen_zero_quantile``. ``'eps'`` retains the legacy ``1e-6`` Box-Cox
+        offset. ``'yeojohnson'`` uses Yeo-Johnson for every value and supports
+        negatives.
     anova_alpha : float, default=0.05
         Significance level used for both the location gate
         (``scipy.stats.f_oneway``) and the scale gate
@@ -127,6 +166,17 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         applies the legacy logarithm; ``'zscore'`` applies a training-set
         Z-score (mean 0, standard deviation 1) and reuses those parameters for
         future samples.
+    unseen_zero_quantile : float, default=0.01
+        Quantile of the training positives used as the detection-limit proxy
+        for a marker column that contained no zeros during fitting. Only read
+        when ``zero_handles='percentile'``. Must be in ``(0, 1)``. A low
+        quantile is used rather than the sample minimum so that one extreme
+        observation cannot dictate the score of every future zero.
+    unseen_zero_fraction : float, default=0.5
+        Fraction of that proxy actually imputed, i.e. the LOD/2 substitution
+        convention. The imputation floor is
+        ``unseen_zero_fraction * quantile(positives, unseen_zero_quantile)``.
+        Must be in ``(0, 1]``.
 
     Attributes
     ----------
@@ -149,9 +199,17 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
     zero_fractions_ : dict of int -> float
         Training prevalence ``p0`` of exact zeros for each marker.
     zero_zscores_ : dict of int -> float
-        Score assigned to zeros by percentile handling,
-        ``norm.ppf(p0 / 2)``. ``np.nan`` when no zero was observed or another
-        zero strategy is active.
+        Flat score assigned to zeros by percentile handling,
+        ``norm.ppf(p0 / 2)``. ``np.nan`` when no zero was observed during
+        fitting -- such a column has no tied mass and its zeros are imputed
+        per-sample instead, so no single scalar describes them -- or when
+        another zero strategy is active.
+    zero_floors_ : dict of int -> float
+        Detection-limit proxy at which a zero unseen during fitting is imputed,
+        ``unseen_zero_fraction * quantile(positives, unseen_zero_quantile)``.
+        Strictly positive for a zero-free column under percentile handling;
+        ``np.nan`` otherwise (the column has a tied mass, or another zero
+        strategy is active).
 
     Notes
     -----
@@ -162,6 +220,20 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
 
     Unseen categorical combinations at transform time produce a warning and
     are assigned a Z-score of 0.
+
+    **Zeros unseen during fitting.** With ``zero_handles='percentile'`` a zero
+    is normally scored from its training prevalence ``p0``. A column with
+    ``p0 == 0`` has no such prevalence, so a zero arriving at transform time is
+    treated as a left-censored observation: it is imputed in *raw value* space
+    at ``zero_floors_[col]`` and then scored through the ordinary positive path.
+    Two consequences follow from imputing a concentration rather than pinning a
+    score. First, the score is covariate-adjusted -- the same zero is more
+    extreme where the conditional reference range sits higher -- which is the
+    correct behaviour, because a detection limit is a property of the assay and
+    not of the sample. Second, a transform-time positive whose raw value falls
+    *below* the floor scores below the imputed zero; at the assay floor that
+    ordering carries no meaning, and :meth:`fit` logs at ``INFO`` how many
+    training positives sit below the floor so a badly placed floor is visible.
 
     When calling :meth:`transform` on data that has fewer rows than the
     training set (e.g. a single new sample), you **must** supply matching
@@ -202,6 +274,8 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         anchor_strategy: str = "farthest_point",
         transform_continuous: Optional[str] = None,
         ridge_alpha: float = 0.05,
+        unseen_zero_quantile: float = 0.01,
+        unseen_zero_fraction: float = 0.5,
     ):
         self.categorical_vals = categorical_vals
         self.continuous_vals = continuous_vals
@@ -215,6 +289,8 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         self.anova_alpha = anova_alpha
         self.anchor_strategy = anchor_strategy
         self.transform_continuous = transform_continuous
+        self.unseen_zero_quantile = unseen_zero_quantile
+        self.unseen_zero_fraction = unseen_zero_fraction
         self._fitters: Dict[int, ContinuousSurfaceFitter] = {}
         self._cat_corrections: Dict[int, Dict[Tuple, Tuple[float, float]]] = {}
         self._cat_encoders: Dict[int, Dict] = {}
@@ -259,6 +335,75 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             out[:, j] = [enc[v] for v in cat[:, j]] if enc else cat[:, j].astype(float)
         return out
 
+    def _learn_zero_floor(
+        self,
+        col: int,
+        y_all: np.ndarray,
+        zero_handles: str,
+        zero_count: int,
+    ) -> float:
+        """Learn the detection-limit proxy used for zeros unseen during fitting.
+
+        A marker column with no training zeros has ``p0 = 0``, so the tied-mass
+        score ``Phi^-1(p0 / 2)`` is undefined. Such a zero is instead treated as
+        a left-censored observation and imputed, at transform time, at a low but
+        realistic concentration derived from the training positives:
+
+        ``floor = unseen_zero_fraction * quantile(positives, unseen_zero_quantile)``
+
+        With the defaults this is half the first percentile of the observed
+        positives -- the classic LOD/2 substitution, using a low quantile rather
+        than the sample minimum so that one extreme observation cannot dictate
+        the score of every future zero in the column.
+
+        Parameters
+        ----------
+        col : int
+            Marker-column index, used only for logging.
+        y_all : ndarray of shape (n_samples,)
+            Raw training values for the column, zeros included.
+        zero_handles : str
+            Resolved (lower-cased) zero strategy for this fit.
+        zero_count : int
+            Number of exact zeros observed in ``y_all``.
+
+        Returns
+        -------
+        float
+            The imputation floor, strictly positive, or ``np.nan`` when the
+            column will never need one (``zero_count > 0``, or a non-percentile
+            zero strategy is active).
+        """
+        if zero_handles != "percentile" or zero_count:
+            return np.nan
+        positives = y_all[y_all > 0.0]
+        if positives.size == 0:
+            return np.nan
+        lod_proxy = float(np.quantile(positives, self.unseen_zero_quantile))
+        zero_floor = float(self.unseen_zero_fraction * lod_proxy)
+        below = int(np.count_nonzero(positives < zero_floor))
+        logger.debug(
+            "Marker column %d: no training zeros; unseen zeros will be imputed "
+            "at %.6g (= %.3g x the %.3g quantile of %d positives).",
+            col,
+            zero_floor,
+            self.unseen_zero_fraction,
+            self.unseen_zero_quantile,
+            positives.size,
+        )
+        if below:
+            logger.info(
+                "Marker column %d: %d/%d training positives (%.2f%%) fall below "
+                "the unseen-zero imputation floor %.6g; an imputed zero will "
+                "score above them.",
+                col,
+                below,
+                positives.size,
+                100.0 * below / positives.size,
+                zero_floor,
+            )
+        return zero_floor
+
     def _validate_constraints(self) -> None:
         n_cat = self._n_covariate_cols(self.categorical_vals)
         if n_cat > RobustNormalizerConfig.MAX_CATEGORICAL:
@@ -281,6 +426,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
                 f"ridge_alpha must be a finite non-negative number; "
                 f"got {self.ridge_alpha!r}."
             )
+        _check_unseen_zero_params(self.unseen_zero_quantile, self.unseen_zero_fraction)
         _resolve_continuous_transform(
             self.transform_continuous, self.log_transform_continuous
         )
@@ -317,6 +463,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
                 f"zero_handles must be one of {_ZERO_HANDLES}; "
                 f"got {self.zero_handles!r}."
             )
+        _check_unseen_zero_params(self.unseen_zero_quantile, self.unseen_zero_fraction)
 
         resolved_transform = _resolve_continuous_transform(
             self.transform_continuous, self.log_transform_continuous
@@ -352,6 +499,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         self.zero_counts_: Dict[int, int] = {}
         self.zero_fractions_: Dict[int, float] = {}
         self.zero_zscores_: Dict[int, float] = {}
+        self.zero_floors_: Dict[int, float] = {}
 
         for col in range(X.shape[1]):
             y_all = X[:, col]
@@ -376,6 +524,9 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
             else:
                 zero_zscore = np.nan
             self.zero_zscores_[col] = zero_zscore
+            self.zero_floors_[col] = self._learn_zero_floor(
+                col, y_all, zero_handles, zero_count
+            )
 
             fitter = ContinuousSurfaceFitter(
                 n_bins=self.n_bins,
@@ -470,8 +621,11 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         X : array-like of shape (n_samples, n_markers) or (n_samples,)
             Marker matrix with the same number of columns as used in
             :meth:`fit`. With ``zero_handles='percentile'``, zeros receive a
-            finite score learned from their training prevalence. Negative
-            values require ``zero_handles='yeojohnson'``.
+            finite score learned from their training prevalence, or -- for a
+            column that had no training zeros -- are imputed at
+            ``zero_floors_[col]`` and scored conditionally, with a
+            ``UserWarning``. Negative values require
+            ``zero_handles='yeojohnson'``.
         categorical_vals : ArrayLike, optional
             Override the categorical covariate values stored at construction.
             Must have the same number of rows as ``X`` and the same number of
@@ -497,6 +651,18 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
         UserWarning
             Raised for any categorical combination not seen during
             :meth:`fit`. Affected samples receive a Z-score of 0.
+        UserWarning
+            Raised, under ``zero_handles='percentile'``, for any marker column
+            that receives zeros here but observed none during :meth:`fit`. Those
+            zeros are imputed at ``zero_floors_[col]`` rather than rejected.
+
+        Raises
+        ------
+        ValueError
+            If a marker column contains negative values under
+            ``zero_handles='percentile'``, or if it needs an imputation floor
+            that :meth:`fit` never learned (which happens only when the
+            estimator was fitted under a different ``zero_handles``).
         """
         X = np.asarray(X, dtype=float)
         if X.ndim == 1:
@@ -539,15 +705,36 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
                         "zero_handles='percentile' does not support negative "
                         f"values in marker column {col}; use 'yeojohnson'."
                     )
-                if np.any(zero_mask) and self.zero_counts_[col] == 0:
-                    raise ValueError(
-                        f"Marker column {col} contains zeros at transform time, "
-                        "but no zeros were observed during fit; p0/2 is undefined."
+                impute = bool(np.any(zero_mask)) and self.zero_counts_[col] == 0
+                if impute:
+                    zero_floor = self.zero_floors_.get(col, np.nan)
+                    if not np.isfinite(zero_floor) or zero_floor <= 0.0:
+                        raise ValueError(
+                            f"Marker column {col} contains zeros at transform "
+                            "time, but no zeros were observed during fit and no "
+                            "imputation floor is available (was this fitted with "
+                            "a different zero_handles?). Refit with "
+                            "zero_handles='percentile'."
+                        )
+                    warnings.warn(
+                        f"Marker column {col} contains {int(zero_mask.sum())} "
+                        "zero(s) at transform time, but no zeros were observed "
+                        "during fit; imputing them at the detection-limit proxy "
+                        f"{zero_floor:.6g} and scoring them conditionally."
                     )
-                positive_mask = ~zero_mask
+                    y_work = y_raw.copy()
+                    y_work[zero_mask] = zero_floor
+                else:
+                    y_work = y_raw
+                # Rows that still receive the flat Phi^-1(p0/2) score. Imputed
+                # zeros are scored as positives, so none remain in that case.
+                flat_mass_mask = (
+                    np.zeros(n_samples, dtype=bool) if impute else zero_mask
+                )
+                positive_mask = ~flat_mass_mask
                 z_base = np.zeros(n_samples, dtype=float)
                 if np.any(positive_mask):
-                    y_bc = fitter._transform(y_raw[positive_mask], fitter.lambda_)
+                    y_bc = fitter._transform(y_work[positive_mask], fitter.lambda_)
                     mu_pred, sigma_pred = fitter.predict_mu_sigma(
                         cont_data[positive_mask]
                     )
@@ -555,6 +742,7 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
                         sigma_pred, 1e-6
                     )
             else:
+                flat_mass_mask = np.zeros(n_samples, dtype=bool)
                 positive_mask = np.ones(n_samples, dtype=bool)
                 y_bc = fitter._transform(y_raw, fitter.lambda_)
                 mu_pred, sigma_pred = fitter.predict_mu_sigma(cont_data)
@@ -583,8 +771,8 @@ class RobustConditionalNormalizer(BaseEstimator, TransformerMixin):
                     )
                     probabilities = np.minimum(probabilities, np.nextafter(1.0, 0.0))
                     X_out[positive_to_map, col] = norm.ppf(probabilities)
-                if np.any(zero_mask):
-                    X_out[zero_mask, col] = self.zero_zscores_[col]
+                if np.any(flat_mass_mask):
+                    X_out[flat_mass_mask, col] = self.zero_zscores_[col]
 
         return X_out
 

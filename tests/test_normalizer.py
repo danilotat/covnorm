@@ -95,6 +95,8 @@ def test_get_params():
     assert params["ridge_alpha"] == 0.05
     assert params["anchor_strategy"] == "farthest_point"
     assert params["transform_continuous"] is None
+    assert params["unseen_zero_quantile"] == 0.01
+    assert params["unseen_zero_fraction"] == 0.5
 
 
 def test_set_params():
@@ -827,9 +829,9 @@ def test_percentile_transform_reuses_training_p0_for_new_batch():
     np.testing.assert_allclose(transformed[:20], expected_from_training)
 
 
-def test_percentile_transform_rejects_zero_unseen_during_fit():
-    rng = np.random.default_rng(103)
-    n = 200
+def _fit_zero_free(n: int = 200, seed: int = 103, **kwargs):
+    """Fit on a strictly positive marker; return (normalizer, cont, y)."""
+    rng = np.random.default_rng(seed)
     train_cont = rng.uniform(20.0, 80.0, (n, 1))
     train_y = rng.gamma(2.0, 5.0, (n, 1))
     normalizer = RobustConditionalNormalizer(
@@ -839,15 +841,196 @@ def test_percentile_transform_rejects_zero_unseen_during_fit():
         degree=2,
         n_iterations=1,
         bin_size=40,
+        **kwargs,
     ).fit(train_y)
+    return normalizer, train_cont, train_y
 
-    new_y = np.array([[0.0], [1.0]])
+
+def test_zero_floors_is_half_the_first_percentile_of_positives():
+    normalizer, _, train_y = _fit_zero_free()
+
+    expected = 0.5 * np.quantile(train_y[:, 0], 0.01)
+    assert normalizer.zero_counts_[0] == 0
+    assert normalizer.zero_fractions_[0] == 0.0
+    assert normalizer.zero_floors_[0] == pytest.approx(expected)
+    assert normalizer.zero_floors_[0] > 0.0
+    # No tied mass exists, so no single scalar describes those zeros.
+    assert np.isnan(normalizer.zero_zscores_[0])
+
+
+def test_unseen_zero_is_imputed_at_lod_proxy():
+    normalizer, _, _ = _fit_zero_free()
+    floor = normalizer.zero_floors_[0]
+
     new_cont = np.array([[30.0], [40.0]])
-    with pytest.raises(ValueError, match="no zeros were observed during fit"):
-        normalizer.transform(
-            new_y,
+    with pytest.warns(UserWarning, match="no zeros were observed during fit"):
+        transformed = normalizer.transform(
+            np.array([[0.0], [1.0]]),
             categorical_vals=np.empty((2, 0)),
             continuous_vals=new_cont,
+        )
+
+    # The imputed zero must score exactly as a positive of `floor` would.
+    reference = normalizer.transform(
+        np.array([[floor], [1.0]]),
+        categorical_vals=np.empty((2, 0)),
+        continuous_vals=new_cont,
+    )
+    np.testing.assert_allclose(transformed, reference)
+    assert np.all(np.isfinite(transformed))
+    # Low but realistic: nowhere near the eps fallback's blow-up.
+    assert -4.0 < transformed[0, 0] < -1.5
+
+
+def test_unseen_zero_score_varies_with_covariates():
+    normalizer, _, _ = _fit_zero_free()
+
+    with pytest.warns(UserWarning, match="no zeros were observed during fit"):
+        transformed = normalizer.transform(
+            np.zeros((3, 1)),
+            categorical_vals=np.empty((3, 0)),
+            continuous_vals=np.array([[25.0], [50.0], [75.0]]),
+        )
+
+    scores = transformed[:, 0]
+    assert np.all(np.isfinite(scores))
+    # A single imputed concentration is scored against a covariate-dependent
+    # reference, so the scores must not collapse to one constant.
+    assert len(np.unique(scores)) == 3
+
+
+def test_unseen_zero_respects_categorical_correction():
+    rng = np.random.default_rng(104)
+    n = 400
+    cat = np.repeat([[0.0], [1.0]], n // 2, axis=0)
+    cont = rng.uniform(20.0, 80.0, (n, 1))
+    y = rng.gamma(2.0, 5.0, n)
+    y[cat[:, 0] == 1.0] *= 3.0  # force a real group offset
+    normalizer = RobustConditionalNormalizer(
+        categorical_vals=cat,
+        continuous_vals=cont,
+        n_bins=6,
+        degree=2,
+        n_iterations=1,
+        bin_size=40,
+    ).fit(y.reshape(-1, 1))
+
+    mu_cat, sigma_cat = normalizer._cat_corrections[0][(1.0,)]
+    assert (mu_cat, sigma_cat) != (0.0, 1.0)
+
+    with pytest.warns(UserWarning, match="no zeros were observed during fit"):
+        scored = normalizer.transform(
+            np.array([[0.0]]),
+            categorical_vals=np.array([[1.0]]),
+            continuous_vals=np.array([[50.0]]),
+        )
+
+    fitter = normalizer._fitters[0]
+    y_bc = fitter._transform(np.array([normalizer.zero_floors_[0]]), fitter.lambda_)
+    mu, sigma = fitter.predict_mu_sigma(np.array([[50.0]]))
+    expected = ((y_bc - mu) / np.maximum(sigma, 1e-6) - mu_cat) / sigma_cat
+    np.testing.assert_allclose(scored[:, 0], expected)
+
+
+def test_unseen_zero_params_move_the_floor():
+    plain, _, train_y = _fit_zero_free()
+    tuned, _, _ = _fit_zero_free(unseen_zero_quantile=0.05, unseen_zero_fraction=0.25)
+
+    assert tuned.zero_floors_[0] == pytest.approx(
+        0.25 * np.quantile(train_y[:, 0], 0.05)
+    )
+    assert tuned.zero_floors_[0] != pytest.approx(plain.zero_floors_[0])
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"unseen_zero_quantile": 0.0}, "unseen_zero_quantile must be in"),
+        ({"unseen_zero_quantile": 1.0}, "unseen_zero_quantile must be in"),
+        ({"unseen_zero_quantile": np.nan}, "unseen_zero_quantile must be in"),
+        ({"unseen_zero_quantile": True}, "unseen_zero_quantile must be a real"),
+        ({"unseen_zero_quantile": "0.01"}, "unseen_zero_quantile must be a real"),
+        ({"unseen_zero_fraction": 0.0}, "unseen_zero_fraction must be in"),
+        ({"unseen_zero_fraction": 1.5}, "unseen_zero_fraction must be in"),
+        ({"unseen_zero_fraction": -np.inf}, "unseen_zero_fraction must be in"),
+        ({"unseen_zero_fraction": False}, "unseen_zero_fraction must be a real"),
+    ],
+)
+def test_unseen_zero_params_validation(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        RobustConditionalNormalizer(
+            categorical_vals=np.empty((10, 0)),
+            continuous_vals=np.arange(10.0).reshape(-1, 1),
+            **kwargs,
+        )
+
+
+def test_unseen_zero_fraction_one_imputes_the_quantile_itself():
+    normalizer, _, train_y = _fit_zero_free(unseen_zero_fraction=1.0)
+    assert normalizer.zero_floors_[0] == pytest.approx(np.quantile(train_y[:, 0], 0.01))
+
+
+def test_zero_inflated_and_zero_free_columns_coexist():
+    rng = np.random.default_rng(105)
+    n = 300
+    cont = rng.uniform(20.0, 80.0, (n, 1))
+    inflated = rng.gamma(2.0, 5.0, n)
+    inflated[:60] = 0.0
+    clean = rng.gamma(2.0, 5.0, n)
+    X = np.column_stack([inflated, clean])
+
+    normalizer = RobustConditionalNormalizer(
+        categorical_vals=np.empty((n, 0)),
+        continuous_vals=cont,
+        n_bins=6,
+        degree=2,
+        n_iterations=1,
+        bin_size=40,
+    ).fit(X)
+
+    assert normalizer.zero_counts_ == {0: 60, 1: 0}
+    assert np.isnan(normalizer.zero_floors_[0])
+    assert normalizer.zero_floors_[1] > 0.0
+    assert np.isnan(normalizer.zero_zscores_[1])
+
+    new_cont = np.array([[50.0], [60.0]])
+    with pytest.warns(UserWarning, match="no zeros were observed during fit"):
+        scored = normalizer.transform(
+            np.zeros((2, 2)),
+            categorical_vals=np.empty((2, 0)),
+            continuous_vals=new_cont,
+        )
+
+    # Column 0 keeps the flat tied-mass score; column 1 is imputed per sample.
+    expected_flat = stats.norm.ppf((60 / n) / 2.0)
+    np.testing.assert_allclose(scored[:, 0], expected_flat)
+    assert scored[0, 1] != pytest.approx(scored[1, 1])
+    assert np.all(np.isfinite(scored))
+
+
+def test_zero_free_column_positives_are_plain_conditional_z():
+    """Regression guard: p0 == 0 must leave positives entirely unremapped."""
+    normalizer, train_cont, train_y = _fit_zero_free()
+    transformed = normalizer.transform(train_y)[:, 0]
+
+    fitter = normalizer._fitters[0]
+    y_bc = fitter._transform(train_y[:, 0], fitter.lambda_)
+    mu, sigma = fitter.predict_mu_sigma(train_cont)
+    mu_cat, sigma_cat = normalizer._cat_corrections[0][()]
+    expected = ((y_bc - mu) / np.maximum(sigma, 1e-6) - mu_cat) / sigma_cat
+    np.testing.assert_allclose(transformed, expected)
+
+
+def test_unseen_zero_without_learned_floor_raises():
+    """Refitting under another strategy must not silently produce NaN scores."""
+    normalizer, _, _ = _fit_zero_free()
+    normalizer.zero_floors_[0] = np.nan  # simulate a fit under zero_handles='eps'
+
+    with pytest.raises(ValueError, match="no imputation floor is available"):
+        normalizer.transform(
+            np.array([[0.0]]),
+            categorical_vals=np.empty((1, 0)),
+            continuous_vals=np.array([[50.0]]),
         )
 
 
